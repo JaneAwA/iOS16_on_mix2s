@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.patch text eol=lf
+*.diff text eol=lf
+*.yml text eol=lf
+*.adt binary
+*.img binary
+*.bin binary

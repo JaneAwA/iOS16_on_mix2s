@@ -1,0 +1,13 @@
+artifacts/
+out/
+*.adt
+*.img
+*.bin
+*.dts
+*.DTB
+__pycache__/
+*.pyc
+*.ipsw
+*.gz
+.env
+token.txt

@@ -1,0 +1,49 @@
+# 小米 Mix 2S (polaris) 硬件参数
+# 来源：ROM 中 boot.img 解出的 64 个扁平设备树之一 dtb_36
+#       model = "Xiaomi Technologies, Inc. Polaris MP v2.1"  ← 零售版 Mix 2S
+# 用途：这些数字被 tools/mkadt.py 写进 AppleDeviceTree，以及 shim 的帧缓冲常量。
+# 工具：ci/decode_dtb.py --boot boot.img --outdir dtb_out --match polaris
+#
+# 结论先行：Mix 2S 与 SWEET (Snapdragon 732G) 的 GIC / 定时器 / 内存布局几乎完全一致，
+#          必须改的只有帧缓冲地址、面板尺寸，以及 UFS 窗口大小。
+
+[中断 / GICv3]                —— 与 SWEET 相同，无需改动
+GICD           0x17a00000  size 0x10000
+GICR           0x17a60000  size 0x100000
+虚拟定时器 PPI  INTID 19               (QTI 编号约定 phys/virt/hyp = 2/3/0)
+安全态         双安全态；Group0 归 TZ，其余 Group1 NS(IRQ)
+DTB 证据       interrupt-controller@17a00000 reg <0x17a00000 0x10000 0x17a60000 0x100000>
+
+[存储 / UFS 主机控制器]
+UFSHC          0x1d84000   size 0x2500        (SWEET mkadt 写 0x3000，实测 0x2500；
+                                               驱动只访问寄存器窗口，两者都能跑)
+
+[显示 / 帧缓冲]              —— 必须改
+                 SWEET              POLARIS (Mix 2S)
+连续 splash/FB   0x9c000000          0x9d400000      ← reserved-memory/cont_splash_region
+FB 长度          0x1700000           0x2400000       (36 MB)
+物理分辨率       1080x2400           1080x2160       (width=0x438 height=0x870)
+stride           1080*4              1080*4
+IOMFB canvas     1125x2436           1080x2160
+面板             -                   S6E3HA3 AMOLED, 60 Hz (framerate=0x3c)
+
+[内存]
+DDR 基址        0x80000000
+reserved 区间   0x85700000 .. 0x9f800000     (cont_splash 止于 0x9f800000)
+PHYS_BASE       0xb0000000      (沿用 SWEET，位于所有 carve-out 之上，已核对)
+MEM_SIZE        0x4d000000
+highmem(真机)   0x100000000 / 0xfcc0000
+
+[CPU 拓扑]  SDM845 Kryo 385 big.LITTLE
+8 核：cluster0 = Cortex-A75 @ 2.8 GHz (core 0-3)，cluster1 = Cortex-A55 @ 1.8 GHz (core 4-7)
+DTB reg = 0x0,0x100,...,0x700  扁平线性 MPIDR (Aff1 = core)
+当前策略：沿用 SWEET 的"扁平 8 核单簇"(MAX_CPU_CLUSTERS=1，ADT 全部 cluster-id=0)，
+         等 ADT 能描述真实 big.LITTLE 再升双簇。
+无 PAC 指针认证 → 内核必须是纯 arm64，不能是 arm64e。
+
+[其他]
+UART / console  qup_uart@0xa84000   (aliases: serial0)
+触控            synaptics,dsx-i2c-force   (非 Goodix)
+PMIC            PM8998 + PMI8998 + PM8005
+GPU             Adreno 630
+               寄存器文档：mesa/src/freedreno/registers/adreno/a6xx*.xml
