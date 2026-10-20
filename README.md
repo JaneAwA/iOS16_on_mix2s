@@ -1,6 +1,6 @@
-# iOS16_on_mix2s
+# iOS16 on mix2s
 
-在**小米 Mix 2S（polaris / Snapdragon 845）**上把 **iOS 16（XNU 8796，iPhone X 的用户态基线）**跑起来。
+在小米 Mix 2S（polaris / Snapdragon 845）上原生运行iOS 16（XNU 8796，iPhone X 的用户态基线）。
 
 技术路线与黑苹果同理：不改写 Apple 二进制，而是用 **Project Mu UEFI（Mu-Silicium）** 把机器伪装成苹果能接受的环境，再用一个自研的 **arm64 boot shim** 把 XNU 内核托起来。
 
