@@ -1,0 +1,130 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 69b13f9..7eb7260 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET POLARIS
+ 
+ endif
+ 
+@@ -62,6 +62,16 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# polaris (SDM845) is built as a sweet variant: every #ifdef guarded by
++# ARM64_BOARD_CONFIG_SWEET (67 call sites) is Qualcomm-generic - GICv3 with two
++# security states, architected timer with virtual-timer INTID 19, 16K pages,
++# ARMv8.2 cores without pointer authentication - and SWEET.h itself contains no
++# SoC-specific addresses at all. Everything that really differs (framebuffer
++# 0x9d400000, 1080x2160 panel, UFS aperture 0x2500) lives in the device tree
++# built by tools/mkadt.py, not in the kernel. Defining SWEET too keeps
++# declaration and use sites in sync (e.g. protos.h declares sweet_vtimer_intid
++# under ARM64_BOARD_CONFIG_SWEET while sleh.c uses it under plain SWEET).
++MACHINE_FLAGS_ARM64_POLARIS = -DARM64_BOARD_CONFIG_POLARIS -DARM64_BOARD_CONFIG_SWEET -march=armv8.2-a+crypto
+ 
+ 
+ #
+@@ -240,6 +250,19 @@ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ ARCH_FLAGS_ARM64          = -arch arm64e
+ else
+ 
++# Neither sweet's Cortex-A76/A55 nor polaris' Kryo 385 implement pointer
++# authentication, so both have to stay plain arm64. Doing this with `override`
++# matters: the value below is declared with `?=`, so anything already present in
++# the environment would make both the EmbeddedDeviceMap lookup and the
++# default-arm64 fallthrough be skipped, silently leaving the target arm64e. Then
++# clang enables ptrauth (so all the __has_feature(ptrauth_calls) code in
++# status.c builds) while HAS_APPLE_PAC stays undefined (it needs
++# CPU_HAS_APPLE_PAC, which only Apple's H13/VMAPPLE define), leaving
++# pmap_sign_user_ptr, pmap_auth_user_ptr and thread->machine.jop_pid undeclared.
++ifeq ($(CURRENT_MACHINE_CONFIG),POLARIS)
++override ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64
++endif
++
+ ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG ?=
+ 
+ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+@@ -260,8 +283,9 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet's Cortex-A76/A55 and polaris' Kryo 385 have no pointer authentication:
++# stay plain arm64
++ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index c7d274f..e88a025 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
+ 	H13.h \
+ 	VMAPPLE.h \
+ 	BCM2837.h \
+-	SWEET.h
++	SWEET.h \
++	POLARIS.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff --git a/pexpert/pexpert/arm64/POLARIS.h b/pexpert/pexpert/arm64/POLARIS.h
+new file mode 100644
+index 0000000..93eca62
+--- /dev/null
++++ b/pexpert/pexpert/arm64/POLARIS.h
+@@ -0,0 +1,48 @@
++/*
++ * Board config for the Xiaomi Mi Mix 2S ("polaris", Qualcomm SDM845 /
++ * Snapdragon 845): Kryo 385 = Cortex-A75 + Cortex-A55, ARMv8.2, no PAC.
++ *
++ * There is deliberately almost nothing here. This target is compiled with both
++ * ARM64_BOARD_CONFIG_POLARIS and ARM64_BOARD_CONFIG_SWEET (see
++ * MACHINE_FLAGS_ARM64_POLARIS in makedefs/MakeInc.def), so pexpert/arm64/SWEET.h
++ * supplies the platform description. That is correct for SDM845, not a shortcut:
++ * everything SWEET.h describes is shared Qualcomm plumbing rather than redmi-
++ * specific detail -
++ *   - generic ARM core like BCM2837: no APPLE_ARM64_ARCH_FAMILY, so none of
++ *     Apple's implementation-defined system registers are touched;
++ *   - ARMv8.2 cores without pointer authentication (Kryo 470 = A76+A55 and
++ *     Kryo 385 = A75+A55 are the same ISA level here) -> the kernel stays
++ *     plain arm64 rather than arm64e;
++ *   - GICv3 with two security states (SecurityExtn=1): TrustZone owns Group 0,
++ *     so the timer and IPIs arrive as Group 1 IRQs through sleh_irq();
++ *   - architected timer PPIs numbered 1/2/3/0, so the virtual timer used by XNU
++ *     is INTID 16 + 3 = 19;
++ *   - 16K pages, 64-byte cache lines, PSCI CPU_ON, no P/E clusters.
++ *
++ * Nothing in SWEET.h carries an SoC address - no UART, framebuffer or storage
++ * base - so what genuinely differs on this board is described in the device
++ * tree that tools/mkadt.py builds and the shim hands to the kernel:
++ *   - framebuffer  cont_splash_region 0x9d400000, size 0x2400000
++ *                  (sweet uses 0x9c000000 / 0x1700000)
++ *   - panel        1080 x 2160 S6E3HA3 AMOLED (sweet is 1080 x 2400)
++ *   - UFS          ufshc@1d84000, aperture 0x2500 (sweet uses 0x3000)
++ *   - GIC          0x17a00000 (distributor) / 0x17a60000 (redistributor)
++ * Read from the real Mix 2S DTB (dtb_36, "Polaris MP v2.1"); see
++ * ../../../../ios-port/POLARIS_HW.md for the decoded table.
++ *
++ * The MAX_* values come from the ARM64_BOARD_CONFIG_SWEET block in
++ * board_config.h and suit SDM845 unchanged for a first boot: 8 cores exposed as
++ * one homogeneous cluster (the A75s are cores 0-3, but the scheduler is not told
++ * they are faster, exactly like sweet). Adding a POLARIS block here as well
++ * would just redefine them, since both macros are set.
++ */
++
++#ifndef _PEXPERT_ARM64_POLARIS_H
++#define _PEXPERT_ARM64_POLARIS_H
++
++#include <pexpert/arm64/SWEET.h>
++
++#define POLARIS                        1
++#define SDM845                         1
++
++#endif /* ! _PEXPERT_ARM64_POLARIS_H */
