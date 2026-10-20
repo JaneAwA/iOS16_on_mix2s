@@ -1,0 +1,752 @@
+diff --git a/.github/workflows/xnu.yml b/.github/workflows/xnu.yml
+index b5addb4..72363dd 100644
+--- a/.github/workflows/xnu.yml
++++ b/.github/workflows/xnu.yml
+@@ -10,8 +10,8 @@ on:
+         description: RELEASE / DEVELOPMENT / DEBUG
+         default: DEVELOPMENT
+       machine_config:
+-        description: xnu MACHINE_CONFIG
+-        default: SWEET
++        description: xnu MACHINE_CONFIG (SWEET=732G, POLARIS=SDM845/Mi Mix 2S)
++        default: POLARIS
+       keep_going:
+         description: make -k (collect all compile errors in one run)
+         default: "true"
+diff --git a/shim/build.sh b/shim/build.sh
+index ffc86a3..546cd26 100755
+--- a/shim/build.sh
++++ b/shim/build.sh
+@@ -17,7 +17,9 @@ $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -W
+ 	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
+ $OBJCOPY -O binary out/shim.elf out/Image
+ # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
+-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
++# Portable: nm prints _end as hex; convert with bash arithmetic (no gawk strtonum).
++size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')
++size=$((16#${size:-0}))
+ truncate -s "$size" out/Image
+ # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
+ # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
+diff --git a/shim/console.h b/shim/console.h
+index 4dfd323..6363945 100644
+--- a/shim/console.h
++++ b/shim/console.h
+@@ -1,9 +1,9 @@
+ #pragma once
+ #include <stdint.h>
+ 
+-#define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
++#define FB_BASE		0x9d400000UL	/* Mix 2S (Polaris) cont_splash_region @9d400000 */
+ #define FB_W		1080
+-#define FB_H		2400
++#define FB_H		2160
+ #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+ 
+ #define RED	0xffff0000U
+diff --git a/shim/mmu.h b/shim/mmu.h
+index 75ede5a..8e0fe77 100644
+--- a/shim/mmu.h
++++ b/shim/mmu.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include <stdint.h>
+ 
+-#define FB_PHYS	0x9c000000UL
++#define FB_PHYS	0x9d400000UL	/* Mix 2S (Polaris) cont_splash_region */
+ 
+ struct mmu_info {
+ 	uint64_t img_lo, img_hi, ttbr;
+diff --git a/tools/mkadt.py b/tools/mkadt.py
+index 410394d..5054c3f 100644
+--- a/tools/mkadt.py
++++ b/tools/mkadt.py
+@@ -1,38 +1,40 @@
+ #!/usr/bin/env python3
+-"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
++"""Build the minimal Apple Device Tree that the xnu needs to boot.
+ 
+ Only what the early boot path actually reads (see NOTES.md); every MMIO
+-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
++address comes from the device's live FDT. Usage:
++  mkadt.py OUT.adt [--sweet|--polaris] [--dump] [--qemu] [--highmem]
++
++Machines:
++  sweet   - Redmi Note 10 Pro (SM7150 / Snapdragon 732G), 1080x2400 panel
++  polaris - Xiaomi Mi Mix 2S (SDM845 / Snapdragon 845), 1080x2160 AMOLED
++            (decoded from the stock boot.img DTB: GIC @0x17a00000/0x17a60000,
++             UFS @0x1d84000, cont_splash framebuffer @0x9d400000, 19.2MHz timer)
++Default is polaris (our port target); pass --sweet to reproduce the original tree.
+ """
+ import hashlib, os, struct, sys
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ import adt  # noqa: E402
+ 
+-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
++# ---- shared (both machines) -------------------------------------------------
++# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md).
++# For SDM845 the reserved-memory carve-outs span 0x85700000..0x9f800000, so
++# 0xb0000000 sits safely above them (verified against the polaris DTB).
+ PHYS_BASE = 0xb0000000
+ MEM_SIZE = 0x4d000000
+-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
+-# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
+-# carve-out is in the low bank and the dynamic pools are limited below 4G.
++# --highmem (phone only): the whole upper DDR bank.
+ HIGH_PHYS_BASE = 0x100000000
+ HIGH_MEM_SIZE = 0xfcc00000
+ # /arm-io children are relative to this; it must not be 0 (serial_init bails)
+ SOC_BASE = 0x01000000
+ 
+-GICD, GICD_SIZE = 0x17a00000, 0x10000
+-GICR, GICR_SIZE = 0x17a60000, 0x100000
+-FB, FB_SIZE = 0x9c000000, 0x1700000
+-SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+-# Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
+-UFS, UFS_SIZE = 0x01d84000, 0x3000
+-TIMEBASE = 19200000
+-VTIMER_INTID = 19
+-# QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
++# QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic
++# timer's CNTFRQ. Identical for both machines (just a dev harness).
+ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
+ QEMU_VTIMER_INTID = 27
+ 
++SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+ 
+ # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
+@@ -43,6 +45,39 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+ #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
+ D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+ 
++# Per-machine MMIO + panel map. Everything else (chosen/cpu/buttons/defaults)
++# is identical between them.
++MACHINES = {
++    'sweet': dict(
++        gicd=0x17a00000, gicd_size=0x10000, gicr=0x17a60000, gicr_size=0x100000,
++        fb=0x9c000000, fb_size=0x1700000, fb_w=1080, fb_h=2400, fb_stride=1080 * 4,
++        ufs=0x01d84000, ufs_size=0x3000,
++        timebase=19200000, vtimer_intid=19,
++        canvas_w=1125, canvas_h=2436,
++        compatible=b'D22AP' + b'iPhone10,3' + b'xiaomi,sweet' + b'qcom,sm7150' + b'AppleARM',
++        model=b'iPhone10,3', target_type=b'D22', target_sub=b'D22AP',
++        io_devtype=b'sweet-io', io_compat=b'sweet-io',
++        cpu_compat=b'qcom,kryo470' + b'ARM,v8',
++        big_clk=2304000000, little_clk=1804800000, big_first=False,
++    ),
++    'polaris': dict(
++        # All decoded from the Mix 2S (polaris) retail DTB, dtb_36 (Polaris MP v2.1):
++        gicd=0x17a00000, gicd_size=0x10000, gicr=0x17a60000, gicr_size=0x100000,
++        fb=0x9d400000, fb_size=0x2400000, fb_w=1080, fb_h=2160, fb_stride=1080 * 4,
++        ufs=0x01d84000, ufs_size=0x2500,
++        timebase=19200000, vtimer_intid=19,
++        canvas_w=1080, canvas_h=2160,
++        compatible=b'D22AP' + b'iPhone10,3' + b'xiaomi,polaris' + b'qcom,sdm845' + b'AppleARM',
++        model=b'iPhone10,3', target_type=b'D22', target_sub=b'D22AP',
++        io_devtype=b'polaris-io', io_compat=b'polaris-io',
++        cpu_compat=b'qcom,kryo385' + b'ARM,v8',
++        # SDM845: cluster 0 = Kryo 385 Gold (Cortex-A75, 2.8GHz, cores 0-3),
++        # cluster 1 = Kryo 385 Silver (Cortex-A55, 1.8GHz, cores 4-7). The DTB
++        # cpu@0..cpu@300 have reg <0x0>..<0x300> => big-first (cores 0-3 big).
++        big_clk=2803200000, little_clk=1804800000, big_first=True,
++    ),
++}
++
+ 
+ def d22ap_product(path=D22AP_ADT):
+     """/product properties of the real D22AP tree, without the syscfg
+@@ -56,6 +91,7 @@ def d22ap_product(path=D22AP_ADT):
+             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+     raise SystemExit(f'{path}: no /product node')
+ 
++
+ u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
+ u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
+ cstr = lambda s: s.encode() + b'\0'
+@@ -68,11 +104,13 @@ def node(name, props=(), children=()):
+     return n
+ 
+ 
+-def build(seed=None, qemu=False, highmem=False):
+-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
++def build(machine='polaris', qemu=False, highmem=False):
++    """Build the ADT for `machine`. qemu=True swaps in QEMU virt's GIC/timer."""
++    m = MACHINES[machine]
+     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+-    seed = seed if seed is not None else os.urandom(64)
++    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (m['gicd'], m['gicr'], m['timebase'])
++    vtimer = QEMU_VTIMER_INTID if qemu else m['vtimer_intid']
++    seed = os.urandom(64)
+     phandle = iter(range(1, 1000))
+     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+ 
+@@ -82,64 +120,41 @@ def build(seed=None, qemu=False, highmem=False):
+         ('dram-size', u64(mem_size)),
+         ('random-seed', seed),
+         ('debug-enabled', u32(1)),
+-        ('firmware-version', cstr('sweet-shim')),
+-        ('system-firmware-version', cstr('sweet-shim')),
+-        # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
+-        # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
+-        # tolerating a missing directory). Fixed stand-in value.
++        ('firmware-version', cstr('polaris-shim' if machine == 'polaris' else 'sweet-shim')),
++        ('system-firmware-version', cstr('polaris-shim' if machine == 'polaris' else 'sweet-shim')),
+         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+-        # libimg4 (cryptexd) aborts "failed to get crypto algorithm" without
+-        # it; real A11+ device trees say sha2-384.
+         ('crypto-hash-method', cstr('sha2-384')),
+-        # MobileGestalt's screen class: display-scale (u32, default 0) comes
+-        # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
+-        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
+-        # 360x800 points (like iPhone X class devices).
+         ('display-scale', u32(3)),
+-        # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
+-        # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
+-        # files), so e.g. DataMigration never records LastSystemVersion and
+-        # migrates on every boot. Synthetic ECID (not the phone's); chip-id
+-        # of the A11 that the iPhone X userland expects.
+         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+         ('chip-id', u32(0x8015)),
+-        # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
+-        # MobileGestalt reads these from /chosen, and mobileactivationd's
+-        # DeviceType then takes its native "Hactivation" branch (state
+-        # Activated without an activation record; no SEP, no baseband here).
+         ('certificate-production-status', u32(0)),
+         ('effective-production-status-ap', u32(0)),
+         ('certificate-security-mode', u32(1)),
+         ('effective-security-mode-sep', u32(1)),
+     ], [node('memory-map', [ph()]),
+-        # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
+-        # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
+-        # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
+-        # The iOS shared cache is in no trust cache, so dyld can only map it
+-        # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
+         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+ 
+-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
+-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
+-    # and uses cpus=N to select an initial prefix (N <= 8).
+-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
++    # 8 cores, flat MPIDR (reg = core<<8) like SWEET: XNU treats them as one
++    # homogeneous cluster (board_config MAX_CPU_CLUSTERS=1). SMP bring-up uses
++    # the same scheme SWEET booted with; revisit only with a 2-cluster ADT.
+     cpu_nodes = []
+     for core in range(1 if qemu else 8):
++        big = (core < 4) if m['big_first'] else (core >= (8 - 4))
+         cpu_nodes.append(node(f'cpu{core}', [
+             ph(),
+             ('device_type', cstr('cpu')),
+-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+-            ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
+-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
++            ('compatible', m['cpu_compat']),
++            ('reg', u32(core << 8)),
++            ('cpu-id', u32(core)),
++            ('cluster-id', u32(0)),
++            ('cluster-type', u32(0)),
+             ('die-cluster-id', u32(0)),
+             ('cluster-core-id', u32(core)),
+-            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+-            ('l3-cache-id', u32(0)),     # shared L3
++            ('l2-cache-id', u32(core)),
++            ('l3-cache-id', u32(0)),
+             ('state', cstr('running' if core == 0 else 'stopped')),
+             ('timebase-frequency', u32(timebase)),
+-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
++            ('clock-frequency', u32(m['big_clk'] if big else m['little_clk'])),
+             ('bus-frequency', u32(100000000)),
+             ('memory-frequency', u32(1866000000)),
+             ('peripheral-frequency', u32(timebase)),
+@@ -152,56 +167,42 @@ def build(seed=None, qemu=False, highmem=False):
+         ph(),
+         ('compatible', cstr('arm,gic-v3')),
+         ('interrupt-controller', b''),
+-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
++        ('virtual-timer-intid', u32(vtimer)),
++        ('reg', u64(gicd - SOC_BASE, m['gicd_size'], gicr - SOC_BASE, m['gicr_size'])),
+     ])
+     arm_io = node('arm-io', [
+         ph(),
+-        ('device_type', cstr('sweet-io')),
+-        ('compatible', cstr('sweet-io') + cstr('arm-io')),
++        ('device_type', cstr(m['io_devtype'].decode())),
++        ('compatible', cstr(m['io_compat'].decode()) + cstr('arm-io')),
+         ('#address-cells', u32(2)),
+         ('#size-cells', u32(2)),
+         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+     ], [gic,
+-        # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
+-        # otherwise crashes trying to set the PMU boot stage (customer builds
+-        # ignore the -wdt_no_pmu boot-arg).
+         node('wdt', [ph(), ('no-pmu', u32(1))]),
+-        # Main display: IOMobileFramebuffer.framework counts /arm-io children
+-        # with this device_type and reads the canvas size from the node
+-        # (the presented iPhone X size, see SweetFramebuffer.cpp);
+-        # the kernel's AppleCLCD matches the compatible string.
+         node('disp0', [
+             ph(),
+             ('device_type', cstr('display-subsystem')),
+-            ('compatible', cstr('sweet,display')),
+-            ('canvas-width', u32(1125)),
+-            ('canvas-height', u32(2436)),
++            ('compatible', cstr(('polaris,display' if machine == 'polaris' else 'sweet,display'))),
++            ('canvas-width', u32(m['canvas_w'])),
++            ('canvas-height', u32(m['canvas_h'])),
+         ])])
+ 
+     fbcon = node('sweet-fbcon', [
+         ph(),
+-        ('reg', u64(FB, FB_SIZE)),
+-        ('width', u32(FB_W)),
+-        ('height', u32(FB_H)),
+-        ('stride', u32(FB_STRIDE)),
++        ('reg', u64(m['fb'], m['fb_size'])),
++        ('width', u32(m['fb_w'])),
++        ('height', u32(m['fb_h'])),
++        ('stride', u32(m['fb_stride'])),
+     ])
+ 
+-    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+     ufs = node('sweet-ufs', [
+         ph(),
+         ('compatible', cstr('qcom,ufshc')),
+-        ('reg', u64(UFS, UFS_SIZE)),
++        ('reg', u64(m['ufs'], m['ufs_size'])),
+     ])
+ 
+-    # pmap_compute_max_asids requires the node even when no overrides are set.
+-    # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
+-    # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
+-    # as a plain plist instead of decrypting it with the effaceable key.
+     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+ 
+-    # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
+-    # (D22AP: 2, no Home button; absent = 0 = Home-button device).
+     buttons = node('buttons', [
+         ph(),
+         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
+@@ -212,15 +213,12 @@ def build(seed=None, qemu=False, highmem=False):
+     product_props = d22ap_product()
+     product = [node('product', [ph()] + product_props)] if product_props else []
+ 
+-    # Identity of the iPhone X whose userland runs here: compatible[0] is
+-    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
+-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+     return node('device-tree', [
+         ph(),
+-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+-        ('model', cstr('iPhone10,3')),
+-        ('target-type', cstr('D22')),
+-        ('target-sub-type', cstr('D22AP')),
++        ('compatible', m['compatible']),
++        ('model', m['model']),
++        ('target-type', m['target_type']),
++        ('target-sub-type', m['target_sub']),
+         ('manufacturer', cstr('Apple Inc.')),
+         ('#address-cells', u32(2)),
+         ('#size-cells', u32(2)),
+@@ -228,9 +226,15 @@ def build(seed=None, qemu=False, highmem=False):
+ 
+ 
+ if __name__ == '__main__':
+-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
++    args = sys.argv[1:]
++    machine = 'polaris'
++    if '--sweet' in args:
++        machine = 'sweet'
++    if '--polaris' in args:
++        machine = 'polaris'
++    root = build(machine=machine, qemu='--qemu' in args, highmem='--highmem' in args)
+     blob = adt.serialize(root)
+-    open(sys.argv[1], 'wb').write(blob)
+-    if '--dump' in sys.argv:
++    open(args[0], 'wb').write(blob)
++    if '--dump' in args:
+         adt.dump(adt.parse(blob)[0])
+-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
++    print(f'{args[0]}: {len(blob)} bytes ({machine})', file=sys.stderr)
+diff --git a/tools/mkpayload.py b/tools/mkpayload.py
+index 90ffe77..000ab68 100644
+--- a/tools/mkpayload.py
++++ b/tools/mkpayload.py
+@@ -195,11 +195,21 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+ 
+ if __name__ == '__main__':
+     ap = argparse.ArgumentParser()
+-    ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
++    ap.add_argument('kernel', help='xnu kernel Mach-O (from the POLARIS CI build)')
++    ap.add_argument('adt', nargs='?', help='Apple Device Tree blob; defaults to tools/<machine>.adt')
++    ap.add_argument('out', help='payload file the shim boots (embed in shim-boot.img via build.sh $1)')
++    ap.add_argument('--machine', choices=['polaris', 'sweet'], default='polaris',
++                    help='select the bundled ADT (tools/<machine>.adt) when no positional adt is '
++                         'given; POLARIS is the Mi Mix 2S (SDM845) port target (default)')
+     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
+     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+     a = ap.parse_args()
+-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
++    tools_dir = os.path.dirname(os.path.abspath(__file__))
++    adt_path = a.adt or os.path.join(tools_dir, f'{a.machine}.adt')
++    if not os.path.exists(adt_path):
++        sys.exit(f'ADT not found: {adt_path}\n  pass a positional adt, or run: '
++                 f'python tools/mkadt.py tools/{a.machine}.adt --{a.machine}')
++    blob, info = build(a.kernel, adt_path, a.cmdline, a.ramdisk)
+     open(a.out, 'wb').write(blob)
+     for k, v in info.items():
+         if k != 'segs':
+diff --git a/xnu/patches/0019-stage-libpthread.sh b/xnu/patches/0019-stage-libpthread.sh
+index d7d5adf..6ae3aa4 100644
+--- a/xnu/patches/0019-stage-libpthread.sh
++++ b/xnu/patches/0019-stage-libpthread.sh
+@@ -2,7 +2,9 @@
+ # dxb runs patches/*.sh from the XNU source root before applying *.patch.
+ set -euo pipefail
+ 
+-[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
++# POLARIS is compiled as a SWEET variant (see pexpert/arm64/POLARIS.h), so it
++# needs this provider staged too.
++case "${MACHINE_CONFIG:-}" in SWEET|POLARIS) ;; *) exit 0 ;; esac
+ [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
+     echo 'SWEET libpthread integration requires xnu-8796.141.3 (macOS 13.5)' >&2
+     exit 1
+diff --git a/xnu/patches/0019-sweet-builtin-pthread.patch b/xnu/patches/0019-sweet-builtin-pthread.patch
+index bf000b0..b5c47b0 100644
+--- a/xnu/patches/0019-sweet-builtin-pthread.patch
++++ b/xnu/patches/0019-sweet-builtin-pthread.patch
+@@ -19,8 +19,8 @@ diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+          -Warray-bounds-pointer-arithmetic
+  SFLAGS+= -include meta_features.h
+ +
+-+# This provider is built into SWEET; other boards use their normal kext.
+-+ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+++# This provider is built into SWEET/POLARIS; other boards use their kext.
+++ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)
+ +SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+ +SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+ +sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/xnu/patches/0020-stage-bearssl.sh b/xnu/patches/0020-stage-bearssl.sh
+index 7b93682..2f54d01 100644
+--- a/xnu/patches/0020-stage-bearssl.sh
++++ b/xnu/patches/0020-stage-bearssl.sh
+@@ -1,7 +1,9 @@
+ #!/bin/bash
+ # Pinned, portable constant-time AES for the SWEET legacy CBC/ECB API.
+ set -euo pipefail
+-[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
++# POLARIS is compiled as a SWEET variant (see pexpert/arm64/POLARIS.h), so it
++# needs this provider staged too.
++case "${MACHINE_CONFIG:-}" in SWEET|POLARIS) ;; *) exit 0 ;; esac
+ [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
+ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
+ bearssl_tmp=$(mktemp -d)
+diff --git a/xnu/patches/0020-sweet-portable-aes-cbc.patch b/xnu/patches/0020-sweet-portable-aes-cbc.patch
+index 28d0552..5f429dc 100644
+--- a/xnu/patches/0020-sweet-portable-aes-cbc.patch
++++ b/xnu/patches/0020-sweet-portable-aes-cbc.patch
+@@ -75,7 +75,7 @@ diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+  CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+  SFLAGS+= -include meta_features.h
+ +
+-+ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+++ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)
+ +SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+ +SWEET_AES_INC = -I$(SWEET_AES_ROOT)/inc -I$(SWEET_AES_ROOT)/src
+ +sweet_aes.o_INCFLAGS = $(SWEET_AES_INC)
+diff --git a/xnu/patches/0026-stage-hfs.sh b/xnu/patches/0026-stage-hfs.sh
+index 5ad899a..f9f2c40 100755
+--- a/xnu/patches/0026-stage-hfs.sh
++++ b/xnu/patches/0026-stage-hfs.sh
+@@ -3,7 +3,9 @@
+ # dxb runs patches/*.sh from the XNU source root before applying *.patch.
+ set -euo pipefail
+ 
+-[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
++# POLARIS is compiled as a SWEET variant (see pexpert/arm64/POLARIS.h), so it
++# needs this filesystem staged too.
++case "${MACHINE_CONFIG:-}" in SWEET|POLARIS) ;; *) exit 0 ;; esac
+ [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
+     echo 'SWEET HFS integration requires xnu-8796.141.3 (macOS 13.5)' >&2
+     exit 1
+diff --git a/xnu/patches/0099-polaris-machine-config.patch b/xnu/patches/0099-polaris-machine-config.patch
+new file mode 100644
+index 0000000..7674f51
+--- /dev/null
++++ b/xnu/patches/0099-polaris-machine-config.patch
+@@ -0,0 +1,130 @@
++diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
++index 69b13f9..7eb7260 100644
++--- a/makedefs/MakeInc.def
+++++ b/makedefs/MakeInc.def
++@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
++ else ifneq ($(findstring _host,$(RC_ProjectName)),)
++ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
++ else
++-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
+++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET POLARIS
++ 
++ endif
++ 
++@@ -62,6 +62,16 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
++ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
++ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
++ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+++# polaris (SDM845) is built as a sweet variant: every #ifdef guarded by
+++# ARM64_BOARD_CONFIG_SWEET (67 call sites) is Qualcomm-generic - GICv3 with two
+++# security states, architected timer with virtual-timer INTID 19, 16K pages,
+++# ARMv8.2 cores without pointer authentication - and SWEET.h itself contains no
+++# SoC-specific addresses at all. Everything that really differs (framebuffer
+++# 0x9d400000, 1080x2160 panel, UFS aperture 0x2500) lives in the device tree
+++# built by tools/mkadt.py, not in the kernel. Defining SWEET too keeps
+++# declaration and use sites in sync (e.g. protos.h declares sweet_vtimer_intid
+++# under ARM64_BOARD_CONFIG_SWEET while sleh.c uses it under plain SWEET).
+++MACHINE_FLAGS_ARM64_POLARIS = -DARM64_BOARD_CONFIG_POLARIS -DARM64_BOARD_CONFIG_SWEET -march=armv8.2-a+crypto
++ 
++ 
++ #
++@@ -240,6 +250,19 @@ else ifneq ($(findstring _host,$(RC_ProjectName)),)
++ ARCH_FLAGS_ARM64          = -arch arm64e
++ else
++ 
+++# Neither sweet's Cortex-A76/A55 nor polaris' Kryo 385 implement pointer
+++# authentication, so both have to stay plain arm64. Doing this with `override`
+++# matters: the value below is declared with `?=`, so anything already present in
+++# the environment would make both the EmbeddedDeviceMap lookup and the
+++# default-arm64 fallthrough be skipped, silently leaving the target arm64e. Then
+++# clang enables ptrauth (so all the __has_feature(ptrauth_calls) code in
+++# status.c builds) while HAS_APPLE_PAC stays undefined (it needs
+++# CPU_HAS_APPLE_PAC, which only Apple's H13/VMAPPLE define), leaving
+++# pmap_sign_user_ptr, pmap_auth_user_ptr and thread->machine.jop_pid undeclared.
+++ifeq ($(CURRENT_MACHINE_CONFIG),POLARIS)
+++override ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64
+++endif
+++
++ ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG ?=
++ 
++ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
++@@ -260,8 +283,9 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
++ # Without embdedded device map, use a default arch string
++ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
++ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
++-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
++-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+++# sweet's Cortex-A76/A55 and polaris' Kryo 385 have no pointer authentication:
+++# stay plain arm64
+++ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)
++ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
++ endif
++ endif
++diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
++index c7d274f..e88a025 100644
++--- a/pexpert/pexpert/arm64/Makefile
+++++ b/pexpert/pexpert/arm64/Makefile
++@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
++ 	H13.h \
++ 	VMAPPLE.h \
++ 	BCM2837.h \
++-	SWEET.h
+++	SWEET.h \
+++	POLARIS.h
++ 
++ 
++ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
++diff --git a/pexpert/pexpert/arm64/POLARIS.h b/pexpert/pexpert/arm64/POLARIS.h
++new file mode 100644
++index 0000000..93eca62
++--- /dev/null
+++++ b/pexpert/pexpert/arm64/POLARIS.h
++@@ -0,0 +1,48 @@
+++/*
+++ * Board config for the Xiaomi Mi Mix 2S ("polaris", Qualcomm SDM845 /
+++ * Snapdragon 845): Kryo 385 = Cortex-A75 + Cortex-A55, ARMv8.2, no PAC.
+++ *
+++ * There is deliberately almost nothing here. This target is compiled with both
+++ * ARM64_BOARD_CONFIG_POLARIS and ARM64_BOARD_CONFIG_SWEET (see
+++ * MACHINE_FLAGS_ARM64_POLARIS in makedefs/MakeInc.def), so pexpert/arm64/SWEET.h
+++ * supplies the platform description. That is correct for SDM845, not a shortcut:
+++ * everything SWEET.h describes is shared Qualcomm plumbing rather than redmi-
+++ * specific detail -
+++ *   - generic ARM core like BCM2837: no APPLE_ARM64_ARCH_FAMILY, so none of
+++ *     Apple's implementation-defined system registers are touched;
+++ *   - ARMv8.2 cores without pointer authentication (Kryo 470 = A76+A55 and
+++ *     Kryo 385 = A75+A55 are the same ISA level here) -> the kernel stays
+++ *     plain arm64 rather than arm64e;
+++ *   - GICv3 with two security states (SecurityExtn=1): TrustZone owns Group 0,
+++ *     so the timer and IPIs arrive as Group 1 IRQs through sleh_irq();
+++ *   - architected timer PPIs numbered 1/2/3/0, so the virtual timer used by XNU
+++ *     is INTID 16 + 3 = 19;
+++ *   - 16K pages, 64-byte cache lines, PSCI CPU_ON, no P/E clusters.
+++ *
+++ * Nothing in SWEET.h carries an SoC address - no UART, framebuffer or storage
+++ * base - so what genuinely differs on this board is described in the device
+++ * tree that tools/mkadt.py builds and the shim hands to the kernel:
+++ *   - framebuffer  cont_splash_region 0x9d400000, size 0x2400000
+++ *                  (sweet uses 0x9c000000 / 0x1700000)
+++ *   - panel        1080 x 2160 S6E3HA3 AMOLED (sweet is 1080 x 2400)
+++ *   - UFS          ufshc@1d84000, aperture 0x2500 (sweet uses 0x3000)
+++ *   - GIC          0x17a00000 (distributor) / 0x17a60000 (redistributor)
+++ * Read from the real Mix 2S DTB (dtb_36, "Polaris MP v2.1"); see
+++ * ../../../../ios-port/POLARIS_HW.md for the decoded table.
+++ *
+++ * The MAX_* values come from the ARM64_BOARD_CONFIG_SWEET block in
+++ * board_config.h and suit SDM845 unchanged for a first boot: 8 cores exposed as
+++ * one homogeneous cluster (the A75s are cores 0-3, but the scheduler is not told
+++ * they are faster, exactly like sweet). Adding a POLARIS block here as well
+++ * would just redefine them, since both macros are set.
+++ */
+++
+++#ifndef _PEXPERT_ARM64_POLARIS_H
+++#define _PEXPERT_ARM64_POLARIS_H
+++
+++#include <pexpert/arm64/SWEET.h>
+++
+++#define POLARIS                        1
+++#define SDM845                         1
+++
+++#endif /* ! _PEXPERT_ARM64_POLARIS_H */
+diff --git a/xnu/patches/0100-polaris-master-config.patch b/xnu/patches/0100-polaris-master-config.patch
+new file mode 100644
+index 0000000..9027fcb
+--- /dev/null
++++ b/xnu/patches/0100-polaris-master-config.patch
+@@ -0,0 +1,135 @@
++diff --git a/config/MASTER.arm64.polaris b/config/MASTER.arm64.polaris
++new file mode 100644
++index 0000000..ff88c7b
++--- /dev/null
+++++ b/config/MASTER.arm64.polaris
++@@ -0,0 +1,129 @@
+++#
+++# polaris (Xiaomi Mi Mix 2S, SDM845): the sweet master verbatim.
+++#
+++# Every option here is Qualcomm-generic, not board-specific, and this file being
+++# present at all is what matters: SETUP/config/doconf is invoked with
+++# -soc $(CURRENT_MACHINE_CONFIG_LC) and each component's conf/Makefile only pulls
+++# MASTER.arm64.<machine> in when that file exists, so without it the build falls
+++# back to Apple's stock arm64 master. That one expects the low-level symbols to
+++# come from the KDK's closed lib<SOC>.os.<CONFIG>.a, and here that shows up as
+++# 264 undefined symbols at link time (CleanPoC_Dcache, InvalidatePoU_Icache,
+++# Idle_context, ResetHandlerData, __start, __bcopyin, ...) because nothing
+++# compiled osfmk/arm64/{caches_asm,start,locore,cswitch}.s - those file entries
+++# are tagged `nos_arm_asm`, which is an option that has to be turned on, not a
+++# name saying "no assembly".
+++#
+++# polaris is compiled as a sweet variant anyway (-DARM64_BOARD_CONFIG_SWEET, see
+++# MACHINE_FLAGS_ARM64_POLARIS), so sharing one master is consistent with that.
+++#
+++# Unlike sweet's own file this one is created last, from the fully patched
+++# MASTER.arm64.sweet, so it already carries every later addition: mockfs ramdisk
+++# root, sweet_hfs, bindfs and the stubbed ext resolver.
+++#
+++# Mach Operating System
+++# Copyright (c) 1986 Carnegie-Mellon University
+++# Copyright 2001-2018 Apple Inc.
+++#
+++# All rights reserved.  The CMU software License Agreement
+++# specifies the terms and conditions for use and redistribution.
+++#  
+++######################################################################
+++#
+++#  Master Apple configuration file (see the master machine independent
+++#  configuration file for a description of the file format).
+++#
+++######################################################################
+++#  
+++#  Standard Apple OS Configurations:
+++#  -------- ----- -- ---------------
+++#
+++#  KERNEL_BASE =    [ arm64 config_pmap_ppl medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot nos_arm_asm nos_arm_pmap ]
+++#  KERNEL_RELEASE = [ KERNEL_BASE ]
+++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits ]
+++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits ]
+++#  BSD_BASE =       [ mach_bsd sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump pgo config_personas ]
+++#  BSD_RELEASE =    [ BSD_BASE ]
+++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
+++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
+++#  FILESYS_BASE =   [ devfs fdesc fifo mockfs sweet_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_searchfs config_volfs config_appledouble nullfs bindfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
+++#  FILESYS_RELEASE= [ FILESYS_BASE ]
+++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
+++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
+++#  NFS =            [ nfsserver ]
+++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_monitor config_nexus_flowswitch config_nexus_netif ]
+++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
+++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
+++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
+++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk config_mbuf_jumbo if_bridge MULTIPATH if_fake remote_vif ]
+++#  NETWORKING_RELEASE = [ NETWORKING ]
+++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless ]
+++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
+++#  VPN =            [ ipsec flow_divert necp content_filter ]
+++#  PF =             [ pf pflog ]
+++#  MULTIPATH =      [ multipath mptcp ]
+++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
+++#  HIBERNATION =    [ ]
+++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
+++#  HIBERNATION =    [ ]
+++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
+++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
+++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
+++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
+++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
+++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
+++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
+++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
+++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
+++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption config_pervasive_energy PERFMON_BASE kperf kpc ]
+++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
+++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
+++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
+++#if SOC_IS_VIRTUALIZED
+++#  PARAVIRT_BASE =  [ config_pv_ticket ]
+++#else
+++#  PARAVIRT_BASE =  [ ]
+++#endif /*SOC_IS_VIRTUALIZED*/
+++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
+++#  MACH_RELEASE =   [ MACH_BASE ]
+++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
+++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
+++#  SCHED_BASE =     [ config_sched_traditional config_sched_multiq config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
+++#  SCHED_RELEASE =  [ SCHED_BASE ]
+++#  SCHED_DEV =      [ SCHED_BASE ]
+++#  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
+++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
+++#  VM_RELEASE =     [ VM_BASE ]
+++#  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
+++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
+++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tbi ]
+++#  SECURITY =       [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
+++#  BASE =           [ PF VPN SECURITY NFS ]
+++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE ]
+++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     ]
+++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   ]
+++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   ]
+++#
+++######################################################################
+++#
+++machine		"arm64"						# <arm64>
+++
+++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
+++
+++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
+++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
+++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
+++
+++options   CONFIG_VNODES=1024		# <xsmall>
+++
+++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
+++
+++options	  CONFIG_MACH_APPROXIMATE_TIME
+++
+++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
+++
+++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
+++
+++options CONFIG_HYPERVISOR_PUBLIC   # unrestricted entitlement for hypervisor
+++
+++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
+++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
