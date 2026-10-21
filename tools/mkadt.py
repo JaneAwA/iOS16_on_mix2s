@@ -54,10 +54,10 @@ MACHINES = {
         ufs=0x01d84000, ufs_size=0x3000,
         timebase=19200000, vtimer_intid=19,
         canvas_w=1125, canvas_h=2436,
-        compatible=b'D22AP' + b'iPhone10,3' + b'xiaomi,sweet' + b'qcom,sm7150' + b'AppleARM',
+        compatible=('D22AP', 'iPhone10,3', 'xiaomi,sweet', 'qcom,sm7150', 'AppleARM'),
         model=b'iPhone10,3', target_type=b'D22', target_sub=b'D22AP',
         io_devtype=b'sweet-io', io_compat=b'sweet-io',
-        cpu_compat=b'qcom,kryo470' + b'ARM,v8',
+        cpu_compat=('qcom,kryo470', 'ARM,v8'),
         big_clk=2304000000, little_clk=1804800000, big_first=False,
     ),
     'polaris': dict(
@@ -67,10 +67,10 @@ MACHINES = {
         ufs=0x01d84000, ufs_size=0x2500,
         timebase=19200000, vtimer_intid=19,
         canvas_w=1080, canvas_h=2160,
-        compatible=b'D22AP' + b'iPhone10,3' + b'xiaomi,polaris' + b'qcom,sdm845' + b'AppleARM',
+        compatible=('D22AP', 'iPhone10,3', 'xiaomi,polaris', 'qcom,sdm845', 'AppleARM'),
         model=b'iPhone10,3', target_type=b'D22', target_sub=b'D22AP',
         io_devtype=b'polaris-io', io_compat=b'polaris-io',
-        cpu_compat=b'qcom,kryo385' + b'ARM,v8',
+        cpu_compat=('qcom,kryo385', 'ARM,v8'),
         # SDM845: cluster 0 = Kryo 385 Gold (Cortex-A75, 2.8GHz, cores 0-3),
         # cluster 1 = Kryo 385 Silver (Cortex-A55, 1.8GHz, cores 4-7). The DTB
         # cpu@0..cpu@300 have reg <0x0>..<0x300> => big-first (cores 0-3 big).
@@ -94,7 +94,22 @@ def d22ap_product(path=D22AP_ADT):
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
-cstr = lambda s: s.encode() + b'\0'
+def cstr(s):
+    # Some call sites hand over bytes, some hand over str; accept both.
+    return (s if isinstance(s, bytes) else s.encode()) + b'\0'
+
+
+def strlist(*ss):
+    """A device tree stringlist: NUL separated, NUL terminated.
+
+    Joining with plain b' + ' is not the same thing. A compatible written as
+    b'D22AP' + b'xiaomi,polaris' arrives on the kernel side as ONE string, so
+    every IONameMatch comparing that list misses. It also loses the terminator,
+    so anything that reads the value as a C string runs off the end into the
+    next property - which is how a panic reported the board as
+    "D22APiPhone10,3xiaomi,polarisqcom,sdm845AppleARMmodel".
+    """
+    return b''.join(cstr(s) for s in ss)
 
 
 def node(name, props=(), children=()):
@@ -143,7 +158,7 @@ def build(machine='polaris', qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', m['cpu_compat']),
+            ('compatible', strlist(*m['cpu_compat'])),
             ('reg', u32(core << 8)),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0)),
@@ -215,10 +230,10 @@ def build(machine='polaris', qemu=False, highmem=False):
 
     return node('device-tree', [
         ph(),
-        ('compatible', m['compatible']),
-        ('model', m['model']),
-        ('target-type', m['target_type']),
-        ('target-sub-type', m['target_sub']),
+        ('compatible', strlist(*m['compatible'])),
+        ('model', cstr(m['model'])),
+        ('target-type', cstr(m['target_type'])),
+        ('target-sub-type', cstr(m['target_sub'])),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
