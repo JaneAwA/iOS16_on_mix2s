@@ -1,200 +1,174 @@
-# iOS16_on_mix2s
+# iOS 16 on Xiaomi Mi Mix 2S (`polaris` / Snapdragon 845)
 
-在**小米 Mix 2S（polaris / Snapdragon 845）**上把 **iOS 16（XNU 8796，iPhone X 的用户态基线）**跑起来。
+Bringing **iOS 16 (XNU 8796, iPhone X userspace baseline)** to the **Xiaomi Mi Mix 2S (codename `polaris`, Qualcomm Snapdragon 845 / SDM845)**.
 
-技术路线与黑苹果同理：不改写 Apple 二进制，而是用 **Project Mu UEFI（Mu-Silicium）** 把机器伪装成苹果能接受的环境，再用一个自研的 **arm64 boot shim** 把 XNU 内核托起来。
+## About
 
-```
-   手机开机
-     │
-     ▼
-  stock ABL (小米原厂 bootloader，未替换，保持可回滚)
-     │   fastboot boot  ← 不改分区，重启就回到安卓
-     ▼
-  Mu-Silicium UEFI firmware (polarisPkg, SDM845 平台包)
-     │
-     ▼
-  boot shim  ← shim/          读 FDT / 建页表 / 搬运 XNU payload
-     │
-     ▼
-  XNU kernel  ← xnu/patches/  MACHINE_CONFIG=POLARIS（纯 arm64）
-     │
-     ▼
-  AppleDeviceTree ← tools/mkadt.py   由 Mix 2S 真实 DTB 生成
-     │
-     ▼
-  dyld → launchd → 用户态（iOS 16.7.16 root 体制）
-```
+The strategy mirrors the Hackintosh approach: rather than modifying Apple binaries, the platform is presented to XNU as a target-conformant environment through a **Project Mu UEFI firmware (Mu-Silicium)**, after which a **custom arm64 boot shim** bootstraps the XNU kernel.
 
----
-
-## 先读这里（三条规矩）
-
-1. **本仓库不含任何 Apple 固件。** iPSW、dyld、SpringBoard、字体、框架这些二进制一处都没有，也不提供下载。它们属于 Apple，请自己从你自己的设备/官方渠道取得。仓库里只有我们自己写的配置、补丁、工具和引导桥接代码。
-2. **状态表里的 ✅ / ❌ 只有设备主 @JaneAwA 在真机上确认过才会改。** 其余一律是 ⏳（代码已就位、构建已通过，但没上过真机）或 🔧（尚未实现）。在 PR 里擅自打勾会被打回。想改状态，请在 Issue 里贴真机日志/视频。
-3. **不分发成品镜像。** 仓库的 `artifacts/` 是 gitignore 的，每个人都要自己从源码构建。
-
-图例：
-
-| 符号 | 含义 |
-|---|---|
-| ✅ | 已在真机上确认可用（只有设备主能给） |
-| ❌ | 真机确认不可用 / 该方案已否决 |
-| ⏳ | 代码已实现、构建与产物校验已通过，**等真机确认** |
-| 🔧 | 尚未实现（无对应代码或代码未成型） |
-
----
-
-## 1. 当前进展
-
-到这一步为止，**从源码到可 `fastboot boot` 的完整镜像已经能一次性产出了**：
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| M0 | 从 Mix 2S 固件解码出真实硬件参数（GIC / UFS / 帧缓冲 / 面板 / 内存） | ✅ |
-| M1 | XNU 新增 `POLARIS` 机器配置，编译 + 链接全绿 | ✅ 真机跑到用户态 |
-| M2 | shim 适配 Mix 2S 帧缓冲 `0x9d400000` 与面板 1080×2160 | ✅ 屏幕有输出 |
-| M3 | ADT 生成 → payload 打包 → 合成 Android boot 镜像，三部件字节级校验通过 | ✅ |
-| M3.5 | **UFS 根 + HFS+ 卷 → 自写 init 作为 PID 1 在真机上跑起来** | ✅ 2026-10-21 确认 |
-| M3.6 | 把卷里的自写 init 换成 iPhone X 20H392 的 Apple 用户态（dyld / launchd） | ⏳ 构建中 |
-| — | Mu-Silicium `polaris` UEFI 固件编译成功（1.7 MB，UEFI shell 自检通过） | ⏳ 待真机 |
-| M4+ | 显示管线 / 触控 / GPU / WiFi / 音频 … | 🔧 未开始 |
-
-引导链已经打通到用户态，卡的是**用户态里装的是谁**：现在卷里的 `/sbin/launchd` 是我们自己写的
-16 KB 静态程序（它唯一的工作就是每 5 秒说一次自己还活着），换成 Apple 的那一整套才是 M3.6。
-
----
-
-## 2. 功能适配矩阵
-
-> 状态列在你的机器上跑过之前不会动。「验证方法」一列就是到时候请你做的事。
-
-### 2.1 引导链
-
-| 功能 | 状态 | 实现 / 修复方案 | 你需要这样验证 |
-|---|:--:|---|---|
-| Mi Mix 2S 的 UEFI 固件（Mu-Silicium polarisPkg） | ⏳ | 直接编译上游 `polarisPkg`，未改一行上游代码；构建命令 `python3 build_uefi.py -d polaris` | `fastboot boot Mu-polaris.img`，串口应出 UEFI banner（详见第 6 节） |
-| 不动原 bootloader、可回滚 | ⏳ | 只用 `fastboot boot` 内存引导，**不 flash 任何分区** | 长按电源重启后应正常回到原来的安卓系统 |
-| shim → XNU 控制权交接 | ✅ | `shim/`：读 DTB、建 1:1 页表、把 payload 搬到虚拟地址 `0xfffffe0006000000` 后跳转 | 已确认：内核一路跑到 IOKit 并进入用户态 |
-| 帧缓冲控制台（看屏幕） | ✅ | shim 的 console 直接写面板帧缓冲，1080×2160，2x 字号 | 已确认：开机就有逐行文字，是所有后续调试的实际通道 |
-| UART 串口（115200 8N1） | ⏳ | `shim/console.c` 走 BLSP UART `qup_uart@0xa84000`（DTB aliases: serial0） | 设备主目前是**直接看手机屏**；串口线还没接，这条路未验证 |
-
-### 2.2 内核与机器描述
-
-| 功能 | 状态 | 实现 / 修复方案 | 你需要这样验证 |
-|---|:--:|---|---|
-| XNU `POLARIS` 机器配置 | ✅ | `xnu/patches/0099` + `0100`；Mix 2S 与 SWEET 同为 "generic ARM64 + GICv3 双安全态 + 19.2 MHz timer + 无 PAC"，故 POLARIS.h 直接继承 SWEET.h，差异全部下放到设备树 | 已确认：内核在真机上跑到用户态。`ci/verify_artifacts.py --kernel ...` 会报 cputype `ARM64`（而非 ARM64E） |
-| 不开 PAC / 保持 arm64 | ✅ | 强制 `override ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64`（见修复记录 #2）。Kryo 385 与 iPhone X 的 A11 都没有指针认证 | 同上，cputype 必须是 ARM64 |
-| AppleDeviceTree 生成（Mix 2S 参数） | ✅ | `tools/mkadt.py` 新增 `--polaris`（默认），写入 FB `0x9d400000`、1080×2160、UFS `0x1d84000/0x2500`、DRAM `0xb0000000/0x4d000000`；**SWEET 输出字节不变**（已回归核对） | 已确认：`IOPlatformExpert.cpp:2319` 的 panic 消失。见修复记录 #7（字符串必须 NUL 分隔） |
-| 设备树打包进镜像 | ✅ | boot.img 尾部附 Mix 2S 原始 DTB（491,356 B），shim 启动时解析 | `ci/verify_artifacts.py` 报 dtb byte-identical |
-| 多核（8 核 Kryo 385） | ⏳ | 沿用 SWEET 的扁平 8 核单簇方案（`MAX_CPU_CLUSTERS=1`，ADT 全 `cluster-id=0`）；**目前启动参数是 `cpus=1`**，先单核跑通再谈 big.LITTLE | 去掉 `cpus=1` 后看几颗核起来 |
-| 定时器 / GICv3 中断 | ✅ | 与 SWEET 完全相同，直接继承；虚拟定时器 INTID 19 | 已确认：用户态 init 每 5 秒一次心跳，说明定时器中断在走 |
-
-### 2.3 存储与用户态
-
-| 功能 | 状态 | 实现 / 修复方案 | 你需要这样验证 |
-|---|:--:|---|---|
-| UFS 主机控制器驱动（SDM845） | ✅ | 0028 的 `bsd/dev/sweet_ufs.c`；ADT 里 `/sweet-ufs` 的 reg 是 `<0x1d84000, 0x2500>`——**这是 Mix 2S 的真实值**（sweet 是 `0x3000`）。驱动只读，不碰数据 | 已确认：屏幕出现 `SWEET UFS: "userdata" on LUN 0` 并继续往下走 |
-| HFS+ root 从 UFS 挂载 | ✅ | 卷必须造在 macOS 上：Linux 侧 hfsfuse 是只读的、飞牛 NAS 内核没有 hfsplus 模块、`mkfs.hfsplus` 只出空卷（见修复记录 #8） | 已确认：屏幕出现 `hfs: mounted SweetRoot on device b(1, 0)` |
-| PID 1 从 **UFS 根**上跑起来 | ✅ | 自写的静态 Mach-O init 放进卷的 `/sbin/launchd` | **已确认（2026-10-21）**：屏幕 `*** SWEET userspace: init running as PID 1 ***` + 每 5 秒 `SWEET init: still alive` |
-| PID 1 从 **RAM 盘**上跑起来（`rd=md0`） | ✅ | 同一份 init 塞进 ramdisk 槽 + mockfs，不刷任何分区 | 已确认：屏幕同样出这两行 |
-| Apple 真正的 dyld / launchd | ⏳ | 卷里换成 iPhone X 20H392 的用户态（OS rootfs + 两个 cryptex），dyld 共享缓存硬链到 `/System/Library/Caches/com.apple.dyld` | 屏幕应出 `Darwin Bootstrapper Version 7.0.0` |
-
-### 2.4 外设（全部未开始）
-
-| 功能 | 状态 | 实现 / 修复方案（方案，尚未写代码） |
-|---|:--:|---|
-| 帧缓冲文本控制台 | ✅ | shim 的 console 直接写 `0x9d400000`、1080×2160、2x 字号；已确认是实际调试通道 |
-| 显示（IOMobileFramebuffer / UI 画面） | 🔧 | 文字有了，图形/合成管线还没接：需要按内核实际停的位置补 Apple 显示管线的 veneer 与 FB 属性贴合 |
-| GPU（Adreno 630） | 🔧 | 底稿已在 mesa `src/freedreno/registers/adreno/a6xx*.xml`；可行路径是写 XNU 的 IOGPU/AGX 风格驱动适配层。**未经实证前不预判不可行** |
-| 触控（Synaptics DSX，非 Goodix） | 🔧 | 需 XNU 的 I2C/HID 侧适配，DTB 已确认 `synaptics,dsx-i2c-force` |
-| WiFi / 蓝牙 | 🔧 | 需 SDM845 侧固件与 XNU 网络栈桥接 |
-| 音频 | 🔧 | 需适配 QDSP / ADSP 侧接口 |
-| 相机 | 🔧 | 未开始（依赖 ISP 侧闭源） |
-| 充电 / 电量（PM8998+PMI8998+PM8005） | 🔧 | 未开始。涉及电池管理，风险较高，先把引导跑通再说 |
-| 传感器 / 振动 / 传感器hub | 🔧 | 未开始 |
-| 基带 / 蜂窝网络 | 🔧 | 未开始（modem 分区涉及 IMEI，谨慎） |
-
----
-
-## 3. 仓库地图
+Boot architecture:
 
 ```
-tools/
-  mkadt.py       生成 AppleDeviceTree；--polaris(默认) / --sweet；两机型输出互不干扰
-  check_adt.py   遍历生成的树，报出任何不以 NUL 结尾的字符串属性（#7 就是它抓到的）
-  mkpayload.py   把内核 + ADT + ramdisk 打包成 shim 认得的 payload；--machine 自动选 ADT
-  repack_bootimg.py  只换 boot.img 里 payload 那一槽，不用重编 shim；带往返自测
-  mkhfsroot.sh   在 macOS 上造一个裸 HFS+ 卷（只有它能写 HFS+，见 #8）
-  mkiosroot-macos.sh  把 iOS 16 的三个 APFS 镜像搬进 HFSX 卷，产出可刷的根镜像
-  img2simg.py    raw → Android sparse。10 GB 镜像要刷进分区，非它不可
-  sweet-init.b64 自写的最小 init（base64 文本入库；二进制不进 git）
-shim/
-  console.h mmu.h   Mix 2S 帧缓冲常量（FB_BASE/FB_PHYS 0x9d400000，高 2160）
-  build.sh          交叉编译 shim（纯 bash 算偏移，不依赖 gawk strtonum）
-xnu/patches/
-  0099-polaris-machine-config.patch   POLARIS 机器配置、编译 flags、pexpert 头
-  0100-polaris-master-config.patch    config/MASTER.arm64.polaris（缺它链接会挂）
-  0019-* 0020-* 0026-*                把原本只认 SWEET 的门控放宽到也认 POLARIS
-ci/
-  xnu-polaris.yml         CI 工作流（machine_config 默认 POLARIS）
-  trigger_build.py        触发一次远程 XNU 构建
-  watch_run.py            轮询运行状态并抽取真正到达 clang 的编译参数与错误
-  verify_artifacts.py     上线前自检：boot.img 布局、payload/dtb 字节一致、内核非 arm64e
-  decode_dtb.py           从 boot.img 抽出扁平设备树并挑出行本品那一份
-hardware/polaris.txt      解码出的 Mix 2S 硬件参数表（含 DTB 证据）
-patches/upstream-polaris.diff   相对上游 ios-sweet 的完整差异，一个文件复刻全部改动
-apply_to_upstream.sh       把上面的差异应用到一份 ios-sweet checkout
+ device power-on
+     │
+     ▼
+ stock ABL (Xiaomi factory bootloader; retained, rollback-preserving)
+     │   fastboot boot  ← no partition modified; reboot returns to Android
+     ▼
+ [ Mu-Silicium UEFI firmware (polarisPkg, SDM845 platform package) ]   ← optional stage
+     │
+     ▼
+ boot shim  ← shim/           parse FDT / build page tables / relocate XNU payload
+     │
+     ▼
+ XNU kernel  ← xnu/patches/  MACHINE_CONFIG=POLARIS (pure arm64)
+     │
+     ▼
+ AppleDeviceTree ← tools/mkadt.py   generated from the Mix 2S stock DTB
+     │
+     ▼
+ dyld → launchd → userspace (iOS 16.7.16 root image)
 ```
+
+### Role of Mu-Silicium
+
+Mu-Silicium is a port of **Project Mu** (Microsoft's open-source UEFI implementation framework) that provides `polarisPkg`, a UEFI platform package targeting the Mi Mix 2S (SDM845). Within this project its function is to act as the device's **UEFI firmware stage**: it performs early platform initialization (DRAM configuration, clock and power-resource setup via RPMh, UART and GICv3 configuration) and exposes standard UEFI boot services, from which the boot shim is launched. In the current bring-up the stock ABL is used with `fastboot boot` to load the shim image directly, so the Mu-Silicium UEFI stage is an alternative / optional firmware path; adopting it would replace the stock ABL's early-init responsibility with a standards-based UEFI environment. Build status: UEFI image built (1.7 MB, UEFI shell self-test passed); on-device verification pending.
 
 ---
 
-## 4. 从零复现
+## Read this first (three rules)
 
-依赖 baseline 是 [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)（把 XNU 跑到 Snapdragon 732G 的项目）。XNU **只能在 macOS toolchain 下编译**，所以用 GitHub Actions 的 `macos-14` runner；UEFI 和 shim 在 Linux 上原生编。
+1. **This repository contains no Apple firmware.** No iPSW, dyld, SpringBoard, fonts, or frameworks — and no downloads for them. They are Apple intellectual property; obtain them from your own device or official channels. The repository ships only our own configuration, patches, tooling, and boot bridging code.
+2. **The ✅ / ❌ markers in the status tables change only after the device owner `@JaneAwA` confirms them on real hardware.** Everything else remains ⏳ (code present and build/artifact-verified, but not yet run on device) or 🔧 (not yet implemented). PRs that flip a marker without on-device evidence are rejected. To change a status, attach on-device logs or video in an Issue.
+3. **No prebuilt images are distributed.** `artifacts/` is git-ignored; every user builds from source.
+
+Legend:
+
+| Symbol | Meaning                                                                                  |
+| ------ | ---------------------------------------------------------------------------------------- |
+| ✅      | Confirmed working on real hardware (device owner only)                                   |
+| ❌      | Confirmed non-working on real hardware / approach rejected                               |
+| ⏳      | Implemented; build and artifact verification passed, **awaiting on-device confirmation** |
+| 🔧     | Not yet implemented (no corresponding code, or code not finalized)                       |
+
+---
+
+## 1. Current status
+
+To this point, the **full pipeline from source to a bootable `fastboot boot` image is reproducible in a single pass**:
+
+| Milestone | Content                                                                                                            | Status                                                                             |
+| --------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| M0        | Decode real hardware parameters from Mix 2S firmware (GIC / UFS / framebuffer / panel / memory)                    | ✅                                                                                  |
+| M1        | XNU gains `POLARIS` machine config; compile + link clean                                                           | ✅ confirmed to userspace on device                                                 |
+| M2        | shim adapts Mix 2S framebuffer `0x9d400000` and panel 1080×2160                                                    | ✅ screen output confirmed                                                          |
+| M3        | ADT generation → payload packaging → composite Android boot image; byte-level verification of all three components | ✅                                                                                  |
+| M3.5      | **UFS root + HFS+ volume → custom init running as PID 1 on real hardware**                                         | ✅ confirmed 2026-10-21                                                             |
+| M3.6      | Replace the volume's custom init with iPhone X 20H392 Apple userspace (dyld / launchd)                             | ⏳ In progress — artifact built, download in flight; on-device verification pending |
+| —         | Mu-Silicium `polaris` UEFI firmware built (1.7 MB, UEFI shell self-test passed)                                    | ⏳ awaiting on-device run                                                           |
+| M4+       | Display pipeline / touch / GPU / WiFi / audio …                                                                    | 🔧 not started                                                                     |
+
+The boot chain is brought up through to userspace; the remaining gap is the *contents* of userspace. The current volume's `/sbin/launchd` is a 16 KB static Mach-O program we authored (its only function is to emit a heartbeat every 5 seconds); replacing it with Apple's full userspace stack is the objective of M3.6.
+
+---
+
+## 2. Hardware adaptation matrix
+
+> Status columns do not move until the feature has been exercised on your device. The "Verification" column describes what you will be asked to do.
+
+### 2.1 Boot chain
+
+| Feature                                                  | Status | Implementation / fix                                                                                                   | How you verify                                                                                                               |
+| -------------------------------------------------------- | :----: | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Mi Mix 2S UEFI firmware (Mu-Silicium polarisPkg)         |    ⏳   | Built directly from upstream `polarisPkg`, no upstream line modified; build command `python3 build_uefi.py -d polaris` | `fastboot boot Mu-polaris.img`; serial console should emit the UEFI banner (see §6)                                          |
+| No modification of stock bootloader; rollback-preserving |    ⏳   | `fastboot boot` performs in-RAM boot only, **no partition is flashed**                                                 | After a long-press power reboot, the original Android system should return normally                                          |
+| shim → XNU control transfer                              |    ✅   | `shim/`: parse DTB, build 1:1 page tables, relocate payload to virtual address `0xfffffe0006000000`, then branch       | Confirmed: kernel reaches IOKit and enters userspace                                                                         |
+| Framebuffer console (on-screen)                          |    ✅   | shim console writes directly to the panel framebuffer, 1080×2160, 2× glyph scale                                       | Confirmed: line-by-line text from power-on; the practical debug channel for all subsequent work                              |
+| UART serial (115200 8N1)                                 |    ⏳   | `shim/console.c` uses BLSP UART `qup_uart@0xa84000` (DTB aliases: serial0)                                             | Device owner currently reads the **phone screen directly**; the serial cable is not yet attached, so this path is unverified |
+
+### 2.2 Kernel and machine description
+
+| Feature                                        | Status | Implementation / fix                                                                                                                                                                                              | How you verify                                                                                                            |
+| ---------------------------------------------- | :----: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| XNU `POLARIS` machine config                   |    ✅   | `xnu/patches/0099` + `0100`; Mix 2S and SWEET share "generic ARM64 + GICv3 dual-security + 19.2 MHz timer + no PAC", so `POLARIS.h` inherits `SWEET.h` directly, with all deltas pushed down into the device tree | Confirmed: kernel reaches userspace on device. `ci/verify_artifacts.py --kernel ...` reports cputype `ARM64` (not ARM64E) |
+| PAC disabled / arm64 retained                  |    ✅   | Force `override ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64` (see fix record #2). Kryo 385 and iPhone X's A11 both lack pointer authentication                                                                | Same as above; cputype must be ARM64                                                                                      |
+| AppleDeviceTree generation (Mix 2S parameters) |    ✅   | `tools/mkadt.py` adds `--polaris` (default); writes FB `0x9d400000`, 1080×2160, UFS `0x1d84000/0x2500`, DRAM `0xb0000000/0x4d000000`; **SWEET output bytes unchanged** (regression-checked)                       | Confirmed: the panic at `IOPlatformExpert.cpp:2319` is gone. See fix record #7 (strings must be NUL-terminated)           |
+| Device tree packaged into image                |    ✅   | Mix 2S stock DTB (491,356 B) appended to the boot.img tail; parsed at shim startup                                                                                                                                | `ci/verify_artifacts.py` reports DTB byte-identical                                                                       |
+| Multicore (8× Kryo 385)                        |    ⏳   | Reuses SWEET's flat 8-core single-cluster scheme (`MAX_CPU_CLUSTERS=1`, ADT all `cluster-id=0`); **current boot argument is `cpus=1`** — single core first, big.LITTLE later                                      | Remove `cpus=1` and observe how many cores come up                                                                        |
+| Timer / GICv3 interrupts                       |    ✅   | Identical to SWEET, inherited directly; virtual timer INTID 19                                                                                                                                                    | Confirmed: userspace init heartbeat every 5 s proves the timer interrupt is firing                                        |
+
+### 2.3 Storage and userspace
+
+| Feature                             | Status | Implementation / fix                                                                                                                                                        | How you verify                                                                                                            |
+| ----------------------------------- | :----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| UFS host controller driver (SDM845) |    ✅   | `0028`'s `bsd/dev/sweet_ufs.c`; ADT `/sweet-ufs` reg is `<0x1d84000, 0x2500>` — **the real Mix 2S value** (SWEET uses `0x3000`). Driver is read-only, touches no data       | Confirmed: screen shows `SWEET UFS: "userdata" on LUN 0` and continues                                                    |
+| HFS+ root mounted from UFS          |    ✅   | Volume must be built on macOS: Linux hfsfuse is read-only, the fnOS NAS kernel lacks the hfsplus module, and `mkfs.hfsplus` only yields an empty volume (see fix record #8) | Confirmed: screen shows `hfs: mounted SweetRoot on device b(1, 0)`                                                        |
+| PID 1 from **UFS root**             |    ✅   | Custom static Mach-O init placed at `/sbin/launchd` in the volume                                                                                                           | **Confirmed (2026-10-21)**: screen `*** SWEET userspace: init running as PID 1 ***` + `SWEET init: still alive` every 5 s |
+| PID 1 from **RAM disk** (`rd=md0`)  |    ✅   | Same init placed in the ramdisk slot + mockfs; no partition flashed                                                                                                         | Confirmed: same two lines on screen                                                                                       |
+| Apple's real dyld / launchd         |    ⏳   | Volume replaced with iPhone X 20H392 userspace (OS rootfs + two cryptexes); dyld shared cache hard-linked to `/System/Library/Caches/com.apple.dyld`                        | Screen should show `Darwin Bootstrapper Version 7.0.0`                                                                    |
+
+### 2.4 Peripherals (all unstarted)
+
+| Feature                                        | Status | Implementation / fix (plan, not yet coded)                                                                                                                                                                   |
+| ---------------------------------------------- | :----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Framebuffer text console                       |    ✅   | shim console writes `0x9d400000`, 1080×2160, 2× glyph scale; confirmed as the practical debug channel                                                                                                        |
+| Display (IOMobileFramebuffer / UI rendering)   |   🔧   | Text exists; graphics/compositor pipeline not yet attached — requires a veneer for Apple's display pipeline plus framebuffer property alignment, driven by where the kernel actually stalls                  |
+| GPU (Adreno 630)                               |   🔧   | Register documentation already staged in mesa `src/freedreno/registers/adreno/a6xx*.xml`; viable path is an XNU IOGPU/AGX-style driver adaptation layer. **No conclusion drawn before empirical validation** |
+| Touch (Synaptics DSX, not Goodix)              |   🔧   | Requires XNU I2C/HID-side adaptation; DTB confirms `synaptics,dsx-i2c-force`                                                                                                                                 |
+| WiFi / Bluetooth                               |   🔧   | Requires SDM845 firmware plus XNU network-stack bridging                                                                                                                                                     |
+| Audio                                          |   🔧   | Requires QDSP / ADSP-side interface adaptation                                                                                                                                                               |
+| Camera                                         |   🔧   | Not started (depends on closed-source ISP)                                                                                                                                                                   |
+| Charging / battery (PM8998 + PMI8998 + PM8005) |   🔧   | Not started. Battery management is high-risk; bring up the boot chain first                                                                                                                                  |
+| Sensors / vibrator / sensor hub                |   🔧   | Not started                                                                                                                                                                                                  |
+| Baseband / cellular                            |   🔧   | Not started (modem partition involves IMEI; handle with caution)                                                                                                                                             |
+
+
+## 4. Reproduce from scratch
+
+The baseline is [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (the project that runs XNU on Snapdragon 732G). **XNU compiles only under the macOS toolchain**, so the build uses a GitHub Actions `macos-14` runner; UEFI and shim compile natively on Linux.
 
 ```bash
-# 1) 基线：拿上游 ios-sweet checkout（这里是你的 fork）
+# 1) Baseline: obtain an ios-sweet checkout (your fork)
 git clone https://github.com/<you>/ios-sweet.git
 
-# 2) 把本仓库的全部改动一次性打上去（带 dry-run 检查）
+# 2) Apply this repository's full change set in one pass (with a dry-run check)
 ./apply_to_upstream.sh /path/to/ios-sweet main
 
-# 3) 内核：CI 编（约 1 小时，取决于 runner 排队）
+# 3) Kernel: build on CI (~1 hour, depending on runner queue)
 export GITHUB_TOKEN=ghp_xxx
 ./ci/trigger_build.py --repo <you>/ios-sweet --config POLARIS --wait
 
-# 4) 拿到 kernel.development.polaris 后，生成本地 ADT 与 payload
+# 4) With kernel.development.polaris in hand, generate the local ADT and payload
 python3 tools/mkadt.py --polaris -o tools/polaris.adt
 python3 tools/mkpayload.py --machine polaris -o payload.bin
 
-# 5) shim 与打包
+# 5) shim and packaging
 (cd shim && ./build.sh ../payload.bin)
 mkbootimg --kernel shim/shim.bin --ramdisk payload.bin \
           --dtb dtb_out/dtb_36.dtb -o shim-polaris-kernel-boot.img
 
-# 5b) 根文件系统卷（UFS 根才需要，两档任选）
-     #     最小验证版：一个 32 MB 卷，里面只有一个自写的 /sbin/launchd
+# 5b) Root filesystem volume (UFS root only; either tier)
+     #     Minimal verification tier: a 32 MB volume holding only a custom /sbin/launchd
 base64 -D < tools/sweet-init.b64 > /tmp/sweet-init
 ./tools/mkhfsroot.sh root-hfs.raw 32 /tmp/sweet-init
-     #     完整 iOS 16 版：三个 APFS 镜像出自你自己的 IPSW，仓库不提供
+     #     Full iOS 16 tier: the three APFS images come from your own IPSW; not provided
 ./tools/mkiosroot-macos.sh ios16-root.raw OS.dmg SYSTEMOS.dmg APPOS.dmg
 python3 tools/img2simg.py ios16-root.raw ios16-root.simg
-     #     10 GB 级的镜像只能以 sparse 形式刷（见 #8 里的 max-download-size）
+     #     A 10 GB-class image can only be flashed as sparse (see #8, max-download-size)
 fastboot -S 512M flash userdata ios16-root.simg
 
-# 6) 上线前自检（必须全部 ALL CHECKS PASSED）
+# 6) Pre-flight self-check (must report ALL CHECKS PASSED)
 python3 ci/verify_artifacts.py \
     --image   shim-polaris-kernel-boot.img \
     --payload payload.bin \
     --dtb     dtb_out/dtb_36.dtb \
     --kernel  kernel.development.polaris
 
-# 7) 真机（不写分区，随时可回滚）
+# 7) On device (no partition written; rollback at any time)
 adb reboot bootloader && fastboot boot shim-polaris-kernel-boot.img
 ```
 
-UEFI 固件（可选，独立的一条线，走上游 Mu-Silicium）：
+UEFI firmware (optional; an independent workstream tracked against upstream Mu-Silicium):
 
 ```bash
 python3 Platforms/Xiaomi/polarisPkg/DeviceBuild.py --update -t RELEASE
@@ -203,93 +177,93 @@ python3 build_uefi.py -d polaris
 
 ---
 
-## 5. 修复方案记录
+## 5. Fix records
 
-这一节是"每个问题 → 根因 → 怎么修"的完整留档，方便按顺序理解代码为什么长这样。
-五轮 CI 才把内核编绿，**每一个失败都不是猜出来的，是从失败 run 的日志里挖出来的**。
+This section is a complete log of *problem → root cause → fix*, so the code's current shape is understandable in order. It took five CI rounds to get the kernel to compile clean — **every failure was excavated from the failed run's logs, not guessed.**
 
 ### #1 `Unsupported CURRENT_MACHINE_CONFIG POLARIS`
 
-- 现象：首轮 CI 直接 `MakeInc.kernel:22: *** Unsupported CURRENT_MACHINE_CONFIG POLARIS`。
-- 根因：手写的 `0004b` 补丁 hunk 计数写错（`@@ -9,7` 实际 6 行），`git apply` 判为 corrupt 并**跳过**，于是 POLARIS 从未进入 `SUPPORTED_ARM64_MACHINE_CONFIGS` 白名单；而且补丁插的位置也被后面 13 个补丁反复改动。
-- 修复：下载失败 run 的 `xnu-buildtree` 产物（即**打完全部补丁之后**的 xnu 源码）→ 在 git 里建基线、直接改真文件 → 用 `git diff` 生成 `0099`（hunk 由 git 自己算，不可能错），并统一换行。删掉 `0004b`。
+- Symptom: first CI round failed immediately with `MakeInc.kernel:22: *** Unsupported CURRENT_MACHINE_CONFIG POLARIS`.
+- Root cause: the hand-written `0004b` patch had an incorrect hunk count (`@@ -9,7` for an actual 6 lines); `git apply` judged it corrupt and **skipped it**, so POLARIS never entered the `SUPPORTED_ARM64_MACHINE_CONFIGS` whitelist; the patch's insertion point was also repeatedly reshuffled by the 13 subsequent patches.
+- Fix: download the failed run's `xnu-buildtree` artifact (i.e. xnu **after all patches applied**) → establish a baseline in git → edit the real files directly → generate `0099` with `git diff` (hunk counts computed by git, cannot be wrong), and normalize line endings. Delete `0004b`.
 
-### #2 `-arch arm64e` → ptrauth 符号未定义
+### #2 `-arch arm64e` → undefined ptrauth symbols
 
-- 现象：编译 `-arch arm64e`，`__has_feature(ptrauth_calls)` 打开但 `HAS_APPLE_PAC` 没有，`pmap_sign_user_ptr` / `jop_pid` 未声明；同时 `sweet_vtimer_intid` 在 `sleh.c` 里按 `#if defined(SWEET)` 使用、在 `protos.h` 里按 `#if defined(ARM64_BOARD_CONFIG_SWEET)` 声明，两边对不上。
-- 根因：Kryo 385 和 SWEET 的 Cortex-A76/A55 都没有指针认证，两者都必须是纯 arm64；ARCH_STRING 走的是 `?=`，环境里一旦有值就会静默跳过覆盖，目标仍是 arm64e。
-- 修复：`MakeInc.def` 里用 `ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)` **强制** 纯 arm64；`POLARIS.h` 里 `#include <pexpert/arm64/SWEET.h>`，让 `ARM64_BOARD_CONFIG_SWEET` 与 `POLARIS` 同时有定义，声明与使用两端就一致了（不再重复 include `board_config.h`，避免重复定义）。
+- Symptom: compiled with `-arch arm64e`; `__has_feature(ptrauth_calls)` enabled but `HAS_APPLE_PAC` absent, so `pmap_sign_user_ptr` / `jop_pid` undeclared; meanwhile `sweet_vtimer_intid` is used in `sleh.c` under `#if defined(SWEET)` but declared in `protos.h` under `#if defined(ARM64_BOARD_CONFIG_SWEET)` — the two sides disagree.
+- Root cause: Kryo 385 and SWEET's Cortex-A76/A55 both lack pointer authentication, so both must be pure arm64; `ARCH_STRING` used `?=`, so any value in the environment silently skipped the override, leaving the target as arm64e.
+- Fix: in `MakeInc.def`, use `ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)` to **force** pure arm64; in `POLARIS.h` `#include <pexpert/arm64/SWEET.h>` so `ARM64_BOARD_CONFIG_SWEET` and `POLARIS` are both defined, making declaration and use consistent (without re-including `board_config.h`, which would duplicate definitions).
 
-### #3 缺 `sweet_bearssl/` 与 `sweet_libpthread/`
+### #3 Missing `sweet_bearssl/` and `sweet_libpthread/`
 
-- 现象：`'sweet_bearssl/inc/bearssl_hash.h' file not found`、`'sweet_libpthread/kern/kern_init.c' file not found`。
-- 根因：3 个 stage 脚本 + 2 个 Makefile 补丁把这些信息/utils 用**字面 `== SWEET`** 卡住；而 BearSSL（软件 AES/MD5/SHA）、libpthread（XNU 自带的）、HFS（根文件系统）跟板子没有关系。
-- 修复（5 处）：
-  - `0019-stage-libpthread.sh`、`0020-stage-bearssl.sh`、`0026-stage-hfs.sh`：门控改为 `case ... in SWEET|POLARIS)`；
-  - `0019-sweet-builtin-pthread.patch`、`0020-sweet-portable-aes-cbc.patch`：`ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)` → `ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)`（因为 bsd/conf 的 `-I` 路径必须对 POLARIS 也生效）。
-  - 注意这里是**严格 1:1 行替换**，unified diff 的 hunk 行数不变，避免再踩 #1 的坑。
+- Symptom: `'sweet_bearssl/inc/bearssl_hash.h' file not found`, `'sweet_libpthread/kern/kern_init.c' file not found`.
+- Root cause: 3 stage scripts + 2 Makefile patches gated these info/utils with a **literal `== SWEET`**; but BearSSL (software AES/MD5/SHA), libpthread (XNU's own), and HFS (root filesystem) are board-independent.
+- Fix (5 sites):
+  - `0019-stage-libpthread.sh`, `0020-stage-bearssl.sh`, `0026-stage-hfs.sh`: gate changed to `case ... in SWEET|POLARIS)`.
+  - `0019-sweet-builtin-pthread.patch`, `0020-sweet-portable-aes-cbc.patch`: `ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)` → `ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)` (because bsd/conf's `-I` paths must take effect for POLARIS too).
+  - Note: these are **strict 1:1 line replacements**; the unified-diff hunk line counts are unchanged, avoiding the #1 trap again.
 
-### #4 链接期 264 个未定义符号
+### #4 264 undefined symbols at link time
 
-- 现象：`CleanPoC_Dcache`、`Idle_context`、`__start`、`__bcopyin` … 264 个 undefined。
-- 根因：`config/Makefile` 用 `wildcard` 找 `MASTER.arm64.<machine>`；POLARIS 没有对应文件，**静默回退到 Apple 原版 config**，那份配置期望低层符号来自闭源 KDK 的 `lib<SOC>.os.<CONFIG>.a`（arm64e + Apple Silicon 专用），于是 `osfmk/arm64/*.s` 一个都没编。
-  `nos_arm_asm` 是**需要被打开的选项**，不是"不要汇编"的意思。
-- 修复：新增 `config/MASTER.arm64.polaris`（`0100`）——内容与最终版 `MASTER.arm64.sweet` 逐字相同，里面没有一条是板子相关的；它在最后生成，所以已经带上后续补充（mockfs ramdisk root、sweet_hfs、bindfs、stubbed ext resolver）。
+- Symptom: `CleanPoC_Dcache`, `Idle_context`, `__start`, `__bcopyin` … 264 undefined.
+- Root cause: `config/Makefile` locates `MASTER.arm64.<machine>` via `wildcard`; POLARIS had no such file, so it **silently fell back to Apple's original config**, which expects low-level symbols from the closed-source KDK's `lib<SOC>.os.<CONFIG>.a` (arm64e + Apple Silicon only) — consequently none of `osfmk/arm64/*.s` was compiled.  
+  `nos_arm_asm` is an option that **must be enabled**, not "disable assembly".
+- Fix: add `config/MASTER.arm64.polaris` (`0100`) — byte-identical to the final `MASTER.arm64.sweet`, containing nothing board-specific; generated last, so it already carries the later supplements (mockfs ramdisk root, sweet_hfs, bindfs, stubbed ext resolver).
 
-### #5 对照组：SWEET 也挂
+### #5 Control case: SWEET also fails
 
-- 特意 dispatch 一次 `MACHINE_CONFIG=SWEET`（run 39468989984），**同样失败且同样是 arm64e**。说明该缺陷是环境既有问题，不是 POLARIS 引入的；反过来也佐证 #4 是 POLARIS 专属缺口（SWEET 死在编译，POLARIS 已走到链接）。
+- Deliberately dispatched a `MACHINE_CONFIG=SWEET` run (run 39468989984), which **failed identically and also as arm64e**. This proves the defect is pre-existing in the environment, not introduced by POLARIS; conversely it corroborates that #4 is POLARIS-specific (SWEET died at compile, POLARIS reached link).
 
-### #6 环境与工具坑（重来必看）
+### #6 Environment and tooling pitfalls (mandatory review before re-attempting)
 
-| 坑 | 症状 | 解法 |
-|---|---|---|
-| Windows git autocrlf | 远程 bash 报 `set -o pipefail\r` | 全部源文件 LF（见 `.gitattributes`），脚本跑前确认无 `\r` |
-| Debian awk 是 mawk | `gawk: strtonum` 不存在 | `shim/build.sh` 改用 bash 原生十六进制算术 |
-| 沙箱内 `git push` 被代理拦（CONNECT 502） | push rc=128 | 换 GitHub Contents API 提交，或直接 `git push` 走可达代理 |
-| Contents API 提交**不触发** Actions | 推完没有 run | 每次显式 `workflow_dispatch`（`ci/trigger_build.py`） |
-| `if cmd \| tail; then` | 退出码取自 `tail`，永远为真、误判成功 | 用真实 `$?` / `${PIPESTATUS[0]}` |
-| 只看 CI 网页上的错误摘要 | 找不到第一轮到底错在哪 | 拉 `{run}/logs` 压缩包，直接 grep `*_Build.txt`（`ci/watch_run.py` 就是干这个的） |
-| 本地改了没提交就用脚本推远端 | 推上去的树把远端**回滚**了（见 #9） | 触发构建前跑 `check_remote_sync.py` |
+| Pitfall                                              | Symptom                                                  | Resolution                                                                               |
+| ---------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Windows git autocrlf                                 | Remote bash reports `set -o pipefail\r`                  | All source files LF (see `.gitattributes`); verify no `\r` before running scripts        |
+| Debian awk is mawk                                   | `gawk: strtonum` not found                               | `shim/build.sh` switched to bash-native hex arithmetic                                   |
+| `git push` blocked by proxy in sandbox (CONNECT 502) | push rc=128                                              | Use GitHub Contents API to commit, or `git push` through a reachable proxy               |
+| Contents API commit **does not trigger** Actions     | No run after push                                        | Always dispatch explicitly (`ci/trigger_build.py`)                                       |
+| `if cmd \| tail; then`                               | Exit code taken from `tail`, always true → false success | Use the real `$?` / `${PIPESTATUS[0]}`                                                   |
+| Reading only the CI web error summary                | Cannot locate the first-round error                      | Pull the `{run}/logs` archive, grep `*_Build.txt` directly (`ci/watch_run.py` does this) |
+| Local edits not committed before pushing via script  | Pushed tree **rolls back** remote (see #9)               | Run `check_remote_sync.py` before triggering a build                                     |
 
-### #7 2319 panic 的真根因：ADT 里的字符串没有 NUL 分隔
+### #7 The real root cause of the 2319 panic: ADT strings not NUL-terminated
 
-- 现象：`unable to find driver for this platform:"D22APiPhone10,3xiaomi,polarisqcom,sdm845AppleARMmodel"` @`IOPlatformExpert.cpp:2319`。
-- **我第一次判错了**：以为是内核 personality 表里没有 polaris 条目（表里的 `IONameMatch` 确实写死 `xiaomi,sweet`），于是补了 `xnu/patches/0101` —— 真机上 panic **一字未变**。
-- 真根因在 `tools/mkadt.py`：`compatible` 是**裸拼接** `b'D22AP' + b'iPhone10,3' + b'xiaomi,polaris' + ...`，成了一条 44 字节的字符串。设备树的 `compatible` 是 NUL 分隔的**字符串列表**，`IODTCompareNubName` 拿它跟 `IONameMatch` 逐项比——连成一串等于零个可匹配项，于是落到 `IOPanicPlatform`（那个类的整个存在意义就是 panic）。
-- 顺带解释了 panic 结尾那个突兀的 `model`：连结尾 NUL 都没有，内核按 C 字符串读会越界，把下一个属性的名字一起读进来。**这条串从头到尾都在给答案，我第一次没读懂。**
-- 修复：`strlist()` / `cstr()`（`cstr` 要同时接受 `str` 和 `bytes`，`bytes` 没有 `.encode()`，第一版直接崩）；新增 `tools/check_adt.py` 遍历整棵树报出所有不以 NUL 结尾的字符串属性——修复前 12 处，修复后 0 处；ADT 体积 9912→9920，正好是补上的 NUL 数量。
-- 代价：`0101` 里 CPU（`qcom,kryo385`）和显示（`polaris,display`）两条是必要的，平台专家那条是追着一个不存在的影子补的。
+- Symptom: `unable to find driver for this platform:"D22APiPhone10,3xiaomi,polarisqcom,sdm845AppleARMmodel"` @`IOPlatformExpert.cpp:2319`.
+- **First diagnosis was wrong**: assumed the kernel personality table lacked a polaris entry (its `IONameMatch` is hard-coded to `xiaomi,sweet`), so patch `xnu/patches/0101` was added — the on-device panic was **unchanged**.
+- Real root cause in `tools/mkadt.py`: `compatible` was **concatenated raw** as `b'D22AP' + b'iPhone10,3' + b'xiaomi,polaris' + ...`, forming a single 44-byte string. A device tree's `compatible` is a **NUL-separated string list**; `IODTCompareNubName` compares it entry-by-entry against `IONameMatch` — concatenated into one string, it matches nothing, so it falls through to `IOPanicPlatform` (whose entire reason for existing is to panic).
+- This also explains the abrupt `model` at the panic tail: with no trailing NUL, the kernel reads past the C string boundary and pulls in the next property's name. **The string was answering the question the whole time; the first reading missed it.**
+- Fix: `strlist()` / `cstr()` (`cstr` must accept both `str` and `bytes` — `bytes` has no `.encode()`, the first version crashed outright); added `tools/check_adt.py` to walk the whole tree and report every string property not NUL-terminated — 12 before the fix, 0 after; ADT size 9912 → 9920, exactly the NULs added.
+- Cost: of the two `0101` entries (CPU `qcom,kryo385` and display `polaris,display`), both were necessary; the platform-expert entry was added in response to a non-existent phantom.
 
-### #8 往 HFS+ 卷里灌文件：Linux 全线堵死，改走 macOS
 
-- 需求：卷里得有文件——先是 16 KB 的 init，后来是 10 GB 的 iOS 用户态。
-- 三条路都堵死：
+### #8 Populating the HFS+ volume: Linux is fully blocked; move to macOS
 
-| 办法 | 结果 |
-|---|---|
-| NAS 上 `mount -t hfsplus -o loop` | ❌ 飞牛内核 6.18.18-trim 没有 hfsplus 模块；机器上只有内核头文件、没有源码树，也编不出来 |
-| hfsfuse（现场编译的） | ❌ **设计上只读**，README 原话 "read-only and cannot write to or alter the target filesystem" |
-| 本机 WSL | ❌ 没装 |
+- Requirement: the volume must hold files — first a 16 KB init, later a 10 GB iOS userspace.
+- All three routes blocked:
 
-- 修复：卷造在 macOS runner 上，用 Apple 自己的 `newfs_hfs`——与 XNU 的 hfs kext 同源。产出是**偏移 0 就是 HFS+ 的裸盘**（无 UDIF 尾部、无分区表），fastboot 能直接写。
-- macOS 的两个坑：BSD 的 `base64` 没有 `--decode`（只认 `-D`，4 秒就挂了一次）；无分区表镜像 macOS 有时会合成 slice，挂载要把 `$dev` 和 `${dev}s1` 两个候选都试。
+| Method                            | Result                                                                                                           |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `mount -t hfsplus -o loop` on NAS | ❌ fnOS kernel 6.18.18-trim has no hfsplus module; only kernel headers present, no source tree, cannot compile it |
+| hfsfuse (compiled locally)        | ❌ **read-only by design**; README states "read-only and cannot write to or alter the target filesystem"          |
+| Local WSL                         | ❌ not installed                                                                                                  |
 
-### #9 只留在工作区的改动，会被推送脚本反向推没
+- Fix: build the volume on a macOS runner using Apple's own `newfs_hfs` — same lineage as XNU's hfs kext. Output is a **raw disk with HFS+ at offset 0** (no UDIF trailer, no partition table), directly writable by fastboot.
+- Two macOS pitfalls: BSD `base64` has no `--decode` (accepts only `-D`; failed once after ~4 s); an unpartitioned image is sometimes synthesized with a slice by macOS, so mount must try both `$dev` and `${dev}s1`.
 
-- 现象：新的一轮 CI 报的错和最早那轮一模一样（`pmap_sign_user_ptr` / `jop_pid` 未声明），看着像编译环境问题。
-- 根因：上一轮的关键修复只存在于**本地工作区**，从未 commit；而推送脚本是按本地 `HEAD` 建整棵树的，于是把远端**回滚**成了旧版（远端 0099 只有 4153 字节，好的版本 6410 字节，`MASTER.arm64.polaris` 整个丢失）。
-- 修复：补提交推回去；新写 `check_remote_sync.py`，逐 blob 比对远端树与本地 HEAD，并提示工作区里没提交的内容。**触发构建前必跑。**
+### #9 Working-tree-only changes get pushed away by the sync script
+
+- Symptom: a new CI round reported the exact same error as the very first (`pmap_sign_user_ptr` / `jop_pid` undeclared), looking like a build-environment issue.
+- Root cause: the prior round's key fix existed only in the **local working tree**, never committed; the push script builds the entire tree from local `HEAD`, so it **rolled back** remote to the old version (remote `0099` was only 4153 bytes; the good version is 6410 bytes; `MASTER.arm64.polaris` was lost entirely).
+- Fix: re-commit and push back; add `check_remote_sync.py`, which compares the remote tree against local `HEAD` blob-by-blob and flags uncommitted working-tree changes. **Run before every build trigger.**
 
 ---
 
-## 6. 真机记录与待确认清单
+## 6. On-device record and pending verification
 
-### 6.1 2026-10-21：引导链一路打通到用户态（M3.5）
+### 6.1 2026-10-21: boot chain brought up through to userspace (M3.5)
 
-设备 `faa72261`，`fastboot boot`（内存引导，不写分区）。设备主目前是**直接看手机屏**。
+Device `faa72261`, `fastboot boot` (in-RAM boot, no partition written). Device owner currently reads the **phone screen directly**.
 
-第一次上机，内核跑进了 IOKit 才停：
+First on-device run, kernel stalled only after entering IOKit:
 
 ```
 unable to find driver for this platform:"D22APiPhone10,3xiaomi,polarisqcom,sdm845AppleARMmodel"
@@ -301,14 +275,14 @@ SWEET: trust cache unavailable (Image4/AMFI not installed)
 handshake structure not initialized
 ```
 
-修好设备树后（#7），进到没有根设备：
+After fixing the device tree (#7), it reached no root device:
 
 ```
 Waiting on IOMedia/Apple_HFS
 Failed to write boot-picker-bringup-reason to NVRAM.
 ```
 
-把 HFS+ 卷刷进 `userdata` 并用 `rd=ufsroot0` 之后，卷里还是空的：
+After flashing the HFS+ volume into `userdata` with `rd=ufsroot0`, the volume was still empty:
 
 ```
 SWEET: root volume is not authenticated (error 25): continuing unsealed
@@ -316,7 +290,7 @@ devfs_kernel_mount: kernel_mount failed: 2
 panic: Process 1 exec of /sbin/launchd failed, error 2 @kern_exec.c:6929
 ```
 
-`error 2` = ENOENT，三个位置指向同一件事：**卷是空的**。换成带 `/sbin/launchd` 的卷后：
+`error 2` = ENOENT; all three sites point to the same fact: **the volume was empty**. After switching to a volume containing `/sbin/launchd`:
 
 ```
 *** SWEET userspace: init running as PID 1 ***
@@ -324,41 +298,39 @@ SWEET init: still alive
 SWEET init: still alive
 ```
 
-同一份 init 在 RAM 盘根（`rd=md0`，不刷任何分区）上也是同样两行。
-M3.5 到此确认。
+The same init on the RAM-disk root (`rd=md0`, no partition flashed) produced the same two lines. M3.5 confirmed at this point.
 
-### 6.2 待确认
+### 6.2 Pending verification
 
-> 下面从上往下逐项确认，确认一项改一项状态。**别忘了串口线。**
+> Confirm top-down, one item at a time; flip a status only after confirming. **Do not forget the serial cable.**
 
-- [ ] **串口**：把 Mix 2S 的 UART（`qup_uart@0xa84000`）接到 FTDI，115200 8N1。现在只能看屏幕，看不到滚出屏外的行。
-- [ ] **UEFI 固件单独跑**：`fastboot boot Mu-polaris.img` → 应能看到 Project Mu 的输出/进 UEFI shell。**这一步不写分区，长按电源重启即可回到安卓。**
-- [ ] **完整镜像**：`fastboot boot shim-polaris-kernel-boot.img` → shim banner → XNU 启动日志 →（预期）卡在找不到 root 设备。这个panic 是**符合预期的**，说明引导链通了。
-- [ ] **回滚确认**：重启后安卓正常、串号/IMEI 未变。
-- [ ] **内核 arch**：取下引起不来时，先 `ci/verify_artifacts.py --kernel ...` 确认 cputype 是 ARM64 而不是 ARM64E。
-- [ ] **多核**：日志里确认几颗核被唤醒；adb/lockdownd 之类能起来再说。
+- [ ] **Serial**: connect Mix 2S UART (`qup_uart@0xa84000`) to an FTDI adapter, 115200 8N1. Currently only the screen is readable; lines scrolling past it are invisible.
+- [ ] **UEFI firmware standalone**: `fastboot boot Mu-polaris.img` → should show Project Mu output / drop into the UEFI shell. **This writes no partition; a long-press power reboot returns to Android.**
+- [ ] **Full image**: `fastboot boot shim-polaris-kernel-boot.img` → shim banner → XNU boot log → (expected) stalls at "no root device". This panic is **expected** and confirms the boot chain is live.
+- [ ] **Rollback confirmation**: after reboot, Android is normal and serial/IMEI unchanged.
+- [ ] **Kernel arch**: if it fails to boot, first run `ci/verify_artifacts.py --kernel ...` to confirm cputype is ARM64, not ARM64E.
+- [ ] **Multicore**: confirm in the log how many cores are woken; revisit once adb/lockdownd-class services can start.
 
-失败时请把**完整串口日志**贴进 Issue，而不是"黑屏"三个字——黑屏可能停在 shim、XNUhead、或者 framebuffer 地址不对，三者路子完全不同。
-
----
-
-## 7. 路线图
-
-| 顺序 | 目标 | 说明 |
-|---|---|---|
-| 进行中 | **M3.6**：把 iPhone X 20H392 的用户态放进卷里（OS rootfs + 两个 cryptex + dyld 共享缓存），让 Apple 的 launchd 起来 | 三个已经看清的坎：内核是 macOS 配置，会把 iOS 平台二进制判成 alien（`unentitled_ios_sim_launch=1` 绕）；没有 AMFI，`launchd_cache_loader` 会 abort；dyld 在 ignition level 1 只找 `/System/Library/Caches/com.apple.dyld` |
-| 之后 | M4：显示管线（IOMobileFramebuffer） | 控制台文字已经有了，下一步是给 UI 的显示管线 |
-| 之后 | M5：触控、充电、WiFi 等基础外设 | |
-| 之后 | M5：触控、充电、WiFi 等基础外设 | |
-| stretch | **M6：GPU（Adreno 630）** | mesa a6xx 寄存器文档已就位。**只有在实证后才能下结论**，本仓库不会预先把它判为不可能 |
+On failure, attach the **full serial log** to an Issue, not a bare "black screen" report — a black screen could mean a stall in the shim, XNU head, or a wrong framebuffer address, and the three paths are entirely different.
 
 ---
 
-## 8. 许可与致谢
+## 7. Roadmap
 
-- 本仓库自己写的部分（补丁、工具、shim 改动、CI 脚本）以 **MIT** 发布，见 `LICENSE`。
-- XNU 本身遵循 **Apple Public Source License (APSL)**，版权归 Apple Inc. 与 Carnegie Mellon University；本仓库只提供对此源码的**补丁**，不包含其任何源码。
-- Mu-Silicium / Project Mu 遵循各自的 BSD 系许可与上游仓库协议。
-- 致谢：[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)（XNU-on-Snapdragon 的先行工作）、[Mu-Silicium](https://github.com/mu-silicium)（polarisPkg 的 UEFI 平台包）、mesa/freedreno（Adreno 630 寄存器文档）。
+| Order       | Goal                                                                                                                              | Notes                                                                                                                                                                                                                                                                               |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In progress | **M3.6**: place iPhone X 20H392 userspace in the volume (OS rootfs + two cryptexes + dyld shared cache) so Apple's launchd starts | Three known obstacles: the kernel is built with the macOS config and judges iOS platform binaries as alien (`unentitled_ios_sim_launch=1` bypasses this); no AMFI, so `launchd_cache_loader` aborts; at ignition level 1 dyld looks only in `/System/Library/Caches/com.apple.dyld` |
+| Next        | M4: display pipeline (IOMobileFramebuffer)                                                                                        | Text console exists; next is the UI display pipeline                                                                                                                                                                                                                                |
+| Next        | M5: touch, charging, WiFi and other base peripherals                                                                              |                                                                                                                                                                                                                                                                                     |
+| Stretch     | **M6: GPU (Adreno 630)**                                                                                                          | mesa a6xx register docs already staged. **Conclusion only after empirical validation**; this repository will not pre-judge it as infeasible                                                                                                                                         |
 
-> 本工程为**个人学习与私有设备移植研究**，不提供也不分发任何 Apple 固件或成品镜像。刷机有风险，任何操作请先备份串号分区（persist / modemst / fsg）。
+---
+
+## 8. License and acknowledgments
+
+- The portions authored in this repository (patches, tooling, shim changes, CI scripts) are released under **MIT**; see `LICENSE`.
+- XNU itself is governed by the **Apple Public Source License (APSL)**, copyright Apple Inc. and Carnegie Mellon University; this repository ships only **patches** against that source, never the source itself.
+- Mu-Silicium / Project Mu are governed by their respective BSD-family licenses and upstream repository terms.
+- Acknowledgments: [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (prior work on XNU-on-Snapdragon), [Mu-Silicium](https://github.com/mu-silicium) (the `polarisPkg` UEFI platform package), mesa/freedreno (Adreno 630 register documentation).
+
+> This project is **personal study and private-device porting research**. It provides and distributes no Apple firmware or prebuilt images. Flashing carries risk; back up the serial-number partitions (`persist` / `modemst` / `fsg`) before any operation.
