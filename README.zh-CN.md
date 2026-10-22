@@ -80,11 +80,38 @@ Mu-Silicium 是 **Project Mu**（微软开源 UEFI 实现框架）的一个移�
 | M2   | shim 适配 Mi Mix 2S 帧缓冲 `0x9d400000` 与面板 1080×2160           | ✅ 屏幕输出已确认                  |
 | M3   | ADT 生成 → 载荷打包 → 复合 Android boot 镜像；对全部三个组件做字节级验证           | ✅                          |
 | M3.5 | **UFS 根 + HFS+ 卷 → 自定义 init 作为 PID 1 在真机运行**               | ✅ 已于 2026-10-21 确认         |
-| M3.6 | 用 iPhone X 20H392 的 Apple 用户态（dyld / launchd）替换卷中的自定义 init | ⏳ 进行中——产物已构建，下载进行中；上机验证待进行 |
+| M3.6 | 用 iPhone X 20H392 的 Apple 用户态（dyld / launchd）替换卷中的自定义 init | ⏳ 进行中——干净产物已构建并完成磁盘级校验（0 条 decmpfs 记录）；上机验证待进行 |
 | —    | Mu-Silicium `polaris` UEFI 固件已构建（1.7 MB，UEFI shell 自测通过）   | ⏳ 等待上机运行                   |
 | M4+  | 显示管线 / 触控 / GPU / WiFi / 音频 …                              | 🔧 未开始                     |
 
 引导链已 bring-up 到用户态；剩余的缺口在用户态的*内容*。当前卷里的 `/sbin/launchd` 是我们编写的一个 16 KB 静态 Mach-O 程序（它唯一的功能是每 5 秒发出一次心跳）；用 Apple 的完整用户态栈替换它就是 M3.6 的目标。
+
+### 1.1 `exec /sbin/launchd` 时的 `errno 45`
+
+首次尝试装载 Apple 用户态时，启动过程 panic：
+
+```
+panic: Process 1 exec of /sbin/launchd failed, errno 45 @kern_exec.c:6929
+```
+
+`45` 就是 `EOPNOTSUPP`。根因**不在引导链**，而在卷的*文件系统元数据*：XNU 的
+`bsd/kern/decmpfs.c` 只注册了 **Type 1** 解压器，因此携带 Apple **Type 4（LZVN）**
+压缩的文件无法读取，`decmpfs_read_compressed()` 返回 `EOPNOTSUPP`，
+`load_init_program()` 随即失败。
+
+直接解析 HFS+ 的 catalog 与 attribute 两棵 B 树（`tools/hfsxattr.py` 走叶链，
+**只统计活记录**，自由空间里的残留字节不算）可以量化此前发布的根镜像：
+
+| 度量                                | 此前发布的镜像 | 干净镜像    |
+| --------------------------------- | ----------- | --------- |
+| 活的 `com.apple.decmpfs` xattr 记录数   | 131,125     | **0**     |
+| 带 `UF_COMPRESSED` 标志的文件数          | 131,103     | **0**     |
+| `/sbin/launchd` 数据叉               | 0 字节（内容只在 xattr 里） | 541,600 字节，标准 FAT Mach-O |
+
+内核的 decmpfs 路径要求 vnode **同时**具备 `UF_COMPRESSED` 标志和
+`com.apple.decmpfs` 属性——`/sbin/launchd` 两者皆有。重建后的卷经
+`tools/hfsxattr.py` 判定为 `VERDICT: CLEAN`；该工具可对任意镜像直接判定，
+不依赖 CI 侧的 macOS 检查。
 
 ---
 
