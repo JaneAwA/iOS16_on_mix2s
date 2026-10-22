@@ -80,11 +80,31 @@ To this point, the **full pipeline from source to a bootable `fastboot boot` ima
 | M2        | shim adapts Mix 2S framebuffer `0x9d400000` and panel 1080×2160                                                    | ✅ screen output confirmed                                                          |
 | M3        | ADT generation → payload packaging → composite Android boot image; byte-level verification of all three components | ✅                                                                                  |
 | M3.5      | **UFS root + HFS+ volume → custom init running as PID 1 on real hardware**                                         | ✅ confirmed 2026-10-21                                                             |
-| M3.6      | Replace the volume's custom init with iPhone X 20H392 Apple userspace (dyld / launchd)                             | ⏳ In progress — artifact built, download in flight; on-device verification pending |
+| M3.6      | Replace the volume's custom init with iPhone X 20H392 Apple userspace (dyld / launchd)                             | ⏳ In progress — clean artifact built and verified on-disk (0 decmpfs records); on-device verification pending |
 | —         | Mu-Silicium `polaris` UEFI firmware built (1.7 MB, UEFI shell self-test passed)                                    | ⏳ awaiting on-device run                                                           |
 | M4+       | Display pipeline / touch / GPU / WiFi / audio …                                                                    | 🔧 not started                                                                     |
 
 The boot chain is brought up through to userspace; the remaining gap is the *contents* of userspace. The current volume's `/sbin/launchd` is a 16 KB static Mach-O program we authored (its only function is to emit a heartbeat every 5 seconds); replacing it with Apple's full userspace stack is the objective of M3.6.
+
+### 1.1 `errno 45` at `exec` of `/sbin/launchd`
+
+A first attempt at the Apple userspace volume panicked during boot with:
+
+```
+panic: Process 1 exec of /sbin/launchd failed, errno 45 @kern_exec.c:6929
+```
+
+`45` is `EOPNOTSUPP`. The cause is **not** the boot chain but the volume's *filesystem metadata*: XNU's `bsd/kern/decmpfs.c` only registers a **Type 1** decompressor, so a file that carries Apple's **Type 4 (LZVN)** compression cannot be read. `decmpfs_read_compressed()` returns `EOPNOTSUPP` and `load_init_program()` fails.
+
+Reading the HFS+ catalog and attribute B-trees directly (`tools/hfsxattr.py`, which walks the leaf chain and counts only live records) shows the previously published root image was:
+
+| Measurement                            | Previously published image | Clean image |
+| -------------------------------------- | -------------------------- | ----------- |
+| Live `com.apple.decmpfs` xattr records | 131,125                    | **0**       |
+| Files flagged `UF_COMPRESSED`          | 131,103                    | **0**       |
+| `/sbin/launchd` data fork              | 0 bytes (content only in the xattr) | 541,600 bytes, plain FAT Mach-O |
+
+The kernel's `decmpfs` path is entered when a vnode has both the `UF_COMPRESSED` flag and the `com.apple.decmpfs` attribute; `/sbin/launchd` had both. `tools/hfsxattr.py` reports `VERDICT: CLEAN` for the rebuilt volume and can be run against any image to decide this without relying on the CI's own macOS-side check.
 
 ---
 
