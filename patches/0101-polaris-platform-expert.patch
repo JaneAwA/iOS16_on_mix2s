@@ -1,0 +1,30 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..5f7c7a7 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,25 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++#endif
++#if defined(ARM64_BOARD_CONFIG_POLARIS)
++    "   {"
++    "     'IOClass'         = SweetPlatformExpert;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IONameMatch'     = 'xiaomi,polaris';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetCPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'qcom,kryo385';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = AppleCLCD;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'polaris,display';"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
