@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # iOS 16 on Xiaomi Mi Mix 2S (`polaris` / Snapdragon 845)
 
 Bringing **iOS 16 (XNU 8796, iPhone X userspace baseline)** to the **Xiaomi Mi Mix 2S (codename `polaris`, Qualcomm Snapdragon 845 / SDM845)**.
